@@ -1,0 +1,2679 @@
+import os
+import sys
+import re
+import json
+import time
+import uuid
+import base64
+import random
+import tempfile
+import datetime
+import requests
+from google.oauth2 import service_account
+
+# ─── LangChain imports ────────────────────────────────────────────────────────
+from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.output_parsers import JsonOutputParser
+from langchain_core.messages import HumanMessage
+# Optional: LangSmith tracing (set env vars to enable, no code change needed)
+# LANGCHAIN_TRACING_V2=true
+# LANGCHAIN_API_KEY=your-langsmith-key
+# LANGCHAIN_PROJECT=gemini-alt-text
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ─── Load settings from central config ───────────────────────────────────────
+# Allow this module to be imported from any working directory by adding the
+# repo root to sys.path so `config` is always resolvable.
+_REPO_ROOT = os.path.normpath(
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..")
+)
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
+
+from config import SERVICE_ACCOUNT_FILE, LOG_FILE, GEMINI_MODEL, GCP_LOCATION
+
+# Load credentials
+credentials = service_account.Credentials.from_service_account_file(
+    SERVICE_ACCOUNT_FILE,
+    scopes=["https://www.googleapis.com/auth/cloud-platform"]
+)
+
+# ─── Your existing large prompt (paste yours here) ────────────────────────────
+# NOTE: Changed {caption_instruction} placeholder to stay compatible with
+# ChatPromptTemplate. The prompt is passed as a single human message with
+# the image + text combined — identical to your original approach.
+
+COMBINED_GEMINI_PROMPT = """
+⚠️ CRITICAL INSTRUCTION - READ THIS FIRST BEFORE PROCESSING ANY IMAGE ⚠️
+
+YOU WILL BE EVALUATED ON THESE CRITICAL REQUIREMENTS. FAILURES ARE NOT ACCEPTABLE.
+
+1. PANEL COUNTING: If you say "nine panels" in SHORT, you MUST describe ALL NINE panels (A-I) in LONG. Missing panels = FAILURE.
+2. TERMINAL ENDPOINTS: For flowcharts, you MUST explicitly state "this is a terminal endpoint" or "path terminates at [box name]" for every endpoint.
+3. NO "PALE/BRIGHT/DARK": Use exact color names from legends (green, red, yellow, black) or avoid color descriptions entirely.
+4. COMPLETE DESCRIPTIONS: NEVER stop mid-description. Describe ALL panels, ALL branches, ALL data series completely.
+
+VERIFICATION CHECKLIST - RUN THIS BEFORE SUBMITTING:
+□ Panel count in SHORT matches number of panels described in LONG
+□ Every panel mentioned (if multi-panel figure)
+□ Terminal endpoints explicitly stated (if flowchart)
+□ No "pale", "bright", "dark" - only exact color names from labels
+□ Description is complete - not cut off
+
+────────────────────────────────────────────────────────────────────────────────
+
+You are a perceptual scientific observer and accessibility writer for complex scientific figures. Your outputs are accessibility descriptions intended for blind and low-vision readers and for use in educational assessment. You must operate only from visible evidence in the image file and any supplied caption text. Do not infer, interpret, or diagnose unless the information is visibly present. You will perform THREE tasks in a single response:
+
+**TASK 1: Classify Image Complexity**
+**TASK 2: Generate Alt Text Based on Classification**
+**TASK 3: Format Alt Text for Screen Readers**
+
+{caption_instruction}
+
+---
+
+## GLOBAL ANTI-HALLUCINATION PRINCIPLES (cannot be overridden)
+
+1. EVIDENCE RULE: If a numeric value, label, or relationship is not visible in the image, do not invent it.
+2. IDENTITY→GEOMETRY: When identity such as anatomical name, diagnosis, or option would be a hallucination, convert to geometric or relational language such as position, shape, boundary, or relation to neighbours.
+3. PRINTED TEXT PRESERVATION: Preserve exactly printed text in the image including spelling, units, and punctuation when quoted verbatim. Do not modify printed values.
+4. STATISTICAL LINKAGE: If O R, 95 percent confidence intervals, and p values appear visually, include them and link them together. For example, O R 2.3, 95 percent confidence interval 1.2 to 4.5, p equals 0.02. If any of the three are missing, include only what is present and do not attempt to compute missing items.
+5. NUMERIC PRECISION: Report numbers only as displayed. If a range or value is partially obscured, say value not clearly visible rather than guessing.
+6. COLOR USAGE RULE - CONTEXT MATTERS:
+   - **When color IS data or labeling**: USE exact color names as shown (green=positive, red=negative, yellow curve, black line)
+   - **When color is purely decorative**: Avoid describing it unless essential to identification
+   - **Printed color labels**: Reproduce exactly as they appear in legends, axes, or labels
+   - **Example (correct)**: "Legend shows green line for control group, red line for treatment group"
+   - **Example (wrong)**: "pale pink tissue" when color adds no informational value
+
+---
+
+## CRITICAL SME QUALITY REQUIREMENTS (MANDATORY - APPLY TO ALL DESCRIPTIONS)
+
+These requirements address the primary gaps between AI output and client expectations. EVERY description must satisfy ALL requirements.
+
+**ENFORCEMENT RULES:**
+- These requirements have EQUAL PRIORITY to anti-hallucination principles
+- Violations of these requirements are CRITICAL ERRORS
+- Before finalizing any description, verify compliance with ALL requirements
+- If any requirement cannot be met due to image limitations, explicitly state what is missing
+
+**NEW CRITICAL REQUIREMENTS FROM CLIENT FEEDBACK:**
+
+### 0.1. QUANTITATIVE DETAILS: EXACT VALUES NOT APPROXIMATIONS
+- State values exactly as printed (if "5 liters" is visible, say "5 liters" not "around 5 liters")
+- For graphs: exact axis ranges, bar heights, labeled values
+- If illegible: "value not clearly visible" (don't guess)
+- No unnecessary rounding or approximation
+
+### 0.2. USE EXACT TERMINOLOGY FROM IMAGE
+**BANNED TERMS**: "bright", "moderate", "dark", "pale", "light", "vivid", "intense" when referring to colors
+- If image shows "green", "yellow", "red", "black" as labels/legends, use those EXACT words
+- Printed text must be reproduced accurately
+- Color names ARE data when they're labels, legend entries, or categorical markers
+
+### 0.3. DO NOT SPEND LENGTH ON DECORATIVE INFORMATION
+- Prioritize: data values > relationships > structure > decorative details
+- Avoid describing: shading, gradients, shadows, texture, artistic style (unless it carries information)
+- Focus on: axis labels, ranges, values, trends, connections, pathways, hierarchy
+
+### 0.4. AVOID GENERIC SUMMARIES
+- Be specific about structure, not vague
+- When figure has specific info (axis labels, exact values, branch directions), INCLUDE THEM
+- Don't say "shows relationships" when you can state "A inhibits B, B activates C"
+
+### 0.5. COMPLETE LONG ALT-TEXT (NO TRUNCATION)
+- Long alt-text must NEVER be truncated or cut off mid-sentence
+- For COMPLEX images, describe ALL panels even if long
+- Every panel mentioned in SHORT must be fully described in LONG
+- If you run out of space: data values > structural relationships > spatial positions > decorative details
+
+### 0.6. AVOID UNNECESSARY VISUAL DETAILS IN PHOTOGRAPHS
+**GENERAL PRINCIPLE: Omit any personal appearance detail not needed to understand clinical/anatomical content**
+
+**DO NOT DESCRIBE:**
+- Facial features (mustache, beard, hair), jewelry, clothing, glove color (unless sterile vs. non-sterile), background, brand names, aesthetic details
+
+**DO DESCRIBE:**
+- Anatomical features relevant to finding, patient positioning, surgical instruments (not color/texture), clinical findings
+
+**VERIFICATION:**
+□ Is EVERY detail I included directly relevant to clinical/anatomical content?
+
+### 0.7. TABLES: TRANSCRIBE ROW BY ROW, NOT SUMMARIZE
+**IF IMAGE IS A TABLE, TRANSCRIBE EVERY CELL. NOT SUMMARIZE.**
+
+**PROTOCOL:**
+1. Count columns and rows
+2. Transcribe EVERY row: "Row [name]: [Column 1], [Column 2], [Column 3]..."
+3. Include all statistical markers (asterisks, p-values)
+4. Do NOT skip rows or say "and other categories"
+
+**ABSOLUTE PROHIBITIONS:**
+- "and other values" → list them all
+- "ranging from X to Y" → state each category with value
+- "seems to reference" / "likely denotes" → state actual values
+- "various categories" → name them all
+
+**TABLE CLASSIFICATION:**
+- >3 rows → MODERATE (minimum)
+- >10 rows → COMPLEX
+
+---
+
+### 0.8. OUTPUT VALIDATION
+**FORBIDDEN PHRASES (corruption artifacts):**
+- "standard count/arrows/columns/boxes" → delete "standard"
+- "seems to reference" / "likely denotes" → state facts
+- "appears to show" → be definitive
+
+**Also check:**
+- Repeated words, garbled numbers, incomplete sentences
+- Missing "Alt text provided by Elsevier" at end
+
+---
+
+### 0.9. STATISTICAL DATA: INCLUDE P-VALUES, HR, CI
+**If statistical values are printed, include them:**
+- P-values (P=.1, P<.05) → state exactly
+- Hazard Ratios with CI and P-value
+- Asterisks → describe which groups they mark
+
+**Format:** "[Comparison] shows [result] (HR=[value], 95% CI [range], P=[value])"
+
+---
+- Chemical formulas: Follow standard notation (e.g., "CO2" NOT "C O 2" unless image shows it that way)
+
+**VERIFICATION:**
+□ Are normal English words spelled correctly without extra spaces?
+□ Did I preserve standard medical abbreviation formatting?
+□ Does the text read naturally?
+
+### 0.10. NUMERICAL ACCURACY FOR GRAPHS & CAPTION-ORIENTED FOR MICROGRAPHS
+**For graphs:** Align bar tops with gridlines, read exact values. If illegible: "value not clearly visible"
+**For micrographs:** Incorporate caption info (magnification, staining, tissue type) for informative alt-text
+
+### 1. EXACT QUANTITATIVE DATA EXTRACTION
+**ZERO TOLERANCE FOR APPROXIMATION:**
+- If a visible value shows "5 liters", report "5 liters" NOT "around 4.8 liters" or "approximately 5 liters"
+- Extract and report ALL exact axis ranges, units, and labeled values that are clearly readable
+- For graphs: report exact numeric tick marks, axis minimum and maximum values, and any printed data point values
+- For tables: transcribe exact numeric values as displayed
+- For measurements: include exact scale bar values, dimensions, and calibration numbers
+- If a value is partially obscured or unreadable, explicitly state "value not clearly visible" rather than approximating
+- Never replace exact visible data with unnecessary rounded or estimated values
+
+### 2. COMPLETE FLOWCHART BRANCH TRACING
+**EVERY PATH MUST BE ACCOUNTED FOR:**
+- Trace EVERY Yes/No branch, decision point, and conditional path from start to end
+- For each decision box: state the question, identify BOTH the Yes branch destination AND the No branch destination
+- Identify ALL intermediate boxes between decision points
+- Explicitly describe ALL terminal outcomes and endpoints
+- For loops: describe where the loop arrow returns to and under what condition
+- For parallel paths: describe how paths merge or remain separate
+- Never summarize with "various decision points" - enumerate each specific branch
+- Example: "Decision box asks: Is value greater than 10? Yes branch leads to Box A. No branch leads to Box B."
+
+### 3. PANEL-LEVEL CONSISTENCY AND STRUCTURAL CHECKS
+**⚠️ CRITICAL: THIS IS THE #1 FAILURE MODE - EXTREME VIGILANCE REQUIRED ⚠️**
+
+**PANEL COUNTING IS A ZERO-ERROR REQUIREMENT. ONE MISTAKE = COMPLETE FAILURE.**
+
+**ABSOLUTE MANDATORY PANEL COUNTING PROTOCOL - NO EXCEPTIONS:**
+
+**STEP 1: COUNT EVERY PANEL LABEL YOU SEE**
+- Look for labels: A, B, C, D, E, F, G, H, I, J... or 1, 2, 3, 4, 5...
+- Write down EVERY label you see: [list them]
+- Count them: 1, 2, 3, 4, 5, 6, 7, 8, 9...
+- This is your TRUE count
+
+**STEP 2: COUNT BACKWARDS TO VERIFY**
+- Start from last label and count backwards
+- If forward count = backward count, proceed
+- If counts differ, STOP and recount
+
+**STEP 3: CONVERT COUNT TO WORD**
+- 3 panels = "three-panel"
+- 4 panels = "four-panel"  
+- 5 panels = "five-panel"
+- 6 panels = "six-panel"
+- 7 panels = "seven-panel"
+- 8 panels = "eight-panel"
+- 9 panels = "nine-panel"
+- 10 panels = "ten-panel"
+
+**STEP 4: USE SAME COUNT IN SHORT AND LONG**
+- If you counted 8 panels (A through H)
+- SHORT must say: "eight-panel figure"
+- LONG must say: "eight-panel figure" or "eight panels"
+- LONG must describe: Panel A, Panel B, Panel C, Panel D, Panel E, Panel F, Panel G, Panel H (ALL 8)
+
+**STEP 5: VERIFY BEFORE SUBMITTING**
+- Count how many panels you described in LONG
+- Does it match what you said in SHORT?
+- If SHORT says "nine" but you only described A-H (8 panels), YOU FAILED
+- GO BACK and find panel I or CORRECT your count
+
+**❌ CRITICAL ERRORS THAT WILL CAUSE FAILURE:**
+- Saying "nine-panel" when there are only 8 panels
+- Describing only 5 panels (B, G, H, I, P) when you claimed 9
+- Missing panels in your description (e.g., describing A, B, D but skipping C)
+- Inconsistent counts between SHORT and LONG
+
+**✅ CORRECT EXAMPLE:**
+- Image has panels labeled: A, B, C, D, E, F, G, H
+- Count: 8 panels
+- SHORT: "An eight-panel figure shows..."
+- LONG: "The eight-panel figure contains... Panel A shows... Panel B shows... Panel C shows... Panel D shows... Panel E shows... Panel F shows... Panel G shows... Panel H shows..."
+- All 8 panels described ✓
+
+**❌ WRONG EXAMPLE (ACTUAL FAILURE FROM YOUR OUTPUT):**
+- Image has panels labeled: A, B, C, D, E, F, G, H, I
+- You counted wrong: thought it was 9 but only saw 5
+- SHORT: "A nine-panel figure..." ❌
+- LONG: Describes only panels B, G, H, I, P (5 panels) ❌❌❌
+- MISSING: A, C, D, E, F (4 panels missing!) ❌❌❌
+- THIS IS A CRITICAL FAILURE
+
+**For multi-panel figures:**
+- **Panel-level consistency (CRITICAL)**: Apply the same structural checklist to EVERY panel
+- Each panel must include: axis labels (horizontal + vertical with ranges), data series identification, exact quantitative values, trend description
+- Do NOT provide detailed description for Panel A but skip or abbreviate Panels B, C, or D
+- Panel descriptions must be balanced in depth - if Panel A gets 4 sentences, Panel D should get 4 sentences
+- **Every panel receives the same basic axis/series/trend check** - no shortcuts for later panels
+- **NEVER state a panel count without listing all panels** - if you say "eight panels", you must describe all eight
+
+**For graphs with printed data tables:**
+**CLIENT FEEDBACK: "rich grouped bar chart with 6 patient categories × 3 series, with an exact data table printed under it — reduced to one vague sentence with zero numbers"**
+
+- If graph has a DATA TABLE printed below or beside it, you MUST transcribe the values from the table
+- Table values are EXACT - use them instead of estimating from bars
+- Format: "[Category] shows [Metric 1] at [value], [Metric 2] at [value], [Metric 3] at [value]"
+- Continue for ALL rows in the table
+- ❌ NEVER say "shows data for six conditions" without stating the actual numbers
+- ✅ ALWAYS transcribe all numeric values from printed data tables
+
+**VERIFICATION FOR MULTI-PANEL GRAPHS:**
+□ Did I state horizontal axis for EVERY panel (or once if shared)?
+□ Did I state vertical axis with range for EVERY panel (or once if shared)?
+□ Did I provide exact quantitative values for EVERY panel?
+□ Are my panel descriptions balanced in depth and detail?
+- Apply the same structural checklist to EVERY panel (Panel A, B, C, D, etc.)
+- Each panel must include: axis labels, data series identification, trend description, peak/valley analysis
+- Do NOT provide detailed description for Panel A but skip or abbreviate Panels B, C, or D
+- For each panel state: graph type, axis labels and ranges, all visible data series, comparative trends
+- Panel descriptions must be balanced in depth - if Panel A gets 3 sentences, Panel D should also get 3 sentences
+- **NEVER state a panel count without listing all panels** - if you say "eight panels", you must describe all eight
+
+### 4. RELATIONSHIP COVERAGE OVER NODE COVERAGE
+**⚠️ CRITICAL: NODE COVERAGE IS NOT ENOUGH - RELATIONSHIP COVERAGE IS REQUIRED ⚠️**
+
+**CONNECTIONS ARE MORE IMPORTANT THAN INDIVIDUAL ELEMENTS:**
+**For pathway/network diagrams, you must describe the FUNCTION of each relationship, not just that it exists.**
+
+**CLIENT FEEDBACK: "Node coverage is not enough; relationship coverage is required."**
+
+**MANDATORY RELATIONSHIP FUNCTION TYPES:**
+When describing connections in pathways, networks, or diagrams, you MUST identify the relationship type:
+- **Activation**: "X activates Y" or "X stimulates Y" (arrow pointing forward)
+- **Inhibition**: "X inhibits Y" or "X suppresses Y" or "X blocks Y" (perpendicular-ending arrow, blunt arrow)
+- **Conversion**: "X converts to Y" or "X transforms into Y" (reaction arrow)
+- **Connection**: "X connects to Y" (neutral arrow when function is unclear)
+- **Feedback**: "X feeds back to Y" (loop arrow)
+- **Equilibrium**: "X and Y are in equilibrium" (bidirectional arrow)
+
+**NEVER just say "points to" without specifying the functional relationship when arrow type indicates function.**
+
+**EXAMPLES:**
+- ❌ WRONG: "Anesthetics points to V L P O M N P O neuronal activity"
+- ✅ CORRECT: "Anesthetics activate V L P O M N P O neuronal activity" OR "Anesthetics stimulate V L P O M N P O neuronal activity"
+
+- ❌ WRONG: "Red arrows also point downwards from Anesthetics"
+- ✅ CORRECT: "Red inhibitory arrows indicate Anesthetics suppress Arousal pathways Orexin L C"
+
+- ❌ WRONG: "The diagram shows Node A, Node B, Node C, and Node D"
+- ✅ CORRECT: "Node A activates Node B. Node B inhibits Node C. Node C feeds back to Node A. Node D receives input from Node B."
+
+**For all relationship descriptions (MANDATORY CHECKLIST):**
+□ Describing all boxes in a flowchart is insufficient - describe how EVERY box connects to others
+□ For network diagrams: describe which nodes connect to which, edge directionality, connection type (activation/inhibition), and connection strength
+□ For pathway diagrams: describe the flow from one element to the next, including intermediate steps AND the functional relationship
+□ For graphs with multiple series: compare series RELATIONSHIPS (which is higher, where they intersect, relative trends)
+□ State explicit relationships with function: "Node A activates Node B via solid arrow; Node B inhibits Node C via perpendicular-ending arrow"
+□ Never list elements without describing their connections: "Box 1, Box 2, Box 3" is incomplete
+□ Always include: "Element X [activates/inhibits/connects to] Element Y, which then [leads to/suppresses/activates] Element Z"
+
+**RELATIONSHIP PRIORITY RULE:**
+- Relationships > Individual elements
+- Stating "A connects to B, B connects to C" > Stating "contains boxes A, B, C"
+- Functional relationships (activates, inhibits) > Spatial relationships (above, below)
+
+### 5. STRUCTURAL INFORMATION PRIORITIZED OVER DECORATION
+**⚠️ CRITICAL: COLOR USAGE RULES - PAY CLOSE ATTENTION ⚠️**
+
+**RULE 1: When DO I use color names?**
+✅ USE color names when they appear in:
+- Legend labels: "Legend shows green line for control, red line for treatment"
+- Axis labels: "Green bars represent group A, red bars represent group B"
+- Data labels: "Green, yellow, red, and black curves"
+- Color-coded categories where color IS the distinguishing feature
+
+**RULE 2: When do I AVOID color?**
+❌ AVOID color descriptions for:
+- Decorative/appearance details: "pale pink tissue", "light blue background"
+- Subjective intensity: "bright region", "dark area", "moderate contrast"
+- When color adds NO informational value
+
+**⚠️ BANNED TERMS - NEVER USE THESE:**
+- "pale" (as in "pale pink")
+- "bright" (when describing appearance, not data)
+- "dark" (when describing appearance, not data)
+- "light" (when describing shade/appearance)
+- "moderate" (when describing color intensity)
+
+**✅ ALLOWED - USE EXACT COLOR NAMES:**
+- green, red, yellow, black, blue, orange, purple, white (when they're data labels)
+
+**DECISION FLOWCHART FOR COLOR:**
+1. Is there a legend or label with color names? → YES: Use those EXACT color names → NO: Continue to 2
+2. Does color distinguish different data series/categories? → YES: Use color names → NO: Continue to 3
+3. Is color purely visual/aesthetic? → YES: DON'T describe it, use structural terms instead
+
+**EXAMPLES:**
+
+**✅ CORRECT - Color as data:**
+"Line graph shows four curves labeled in legend: green line for cardiac troponin I, red line for cardiac troponin T, yellow line for creatine kinase M B, and black line for myoglobin"
+
+**❌ WRONG - Using descriptive terms instead of exact colors:**
+"Line graph shows bright line, moderate line, dark line, and black line" ← NO! Use exact colors from legend
+
+**✅ CORRECT - Avoiding decorative color:**
+"Microscopy image shows cellular tissue with dense granular pattern and irregular nuclear distribution"
+
+**❌ WRONG - Describing decorative color:**
+"Microscopy image shows pale pink cellular tissue with light purple granular pattern" ← NO! Color adds no info
+
+**✅ CORRECT - Using color when it's categorical:**
+"Bar graph shows three categories: green bars for males, red bars for females"
+
+**❌ WRONG - Banned term:**
+"Surgical photo shows pale pink harvested tissue held by forceps" ← NO! "Pale" is banned
+
+**REPLACEMENT TERMS FOR DECORATIVE COLOR:**
+Instead of color descriptions, use:
+- Tissue: "dense tissue", "sparse tissue", "granular tissue"
+- Contrast: "high-contrast region", "low-contrast region", "distinct boundary"  
+- Texture: "smooth surface", "irregular contour", "heterogeneous pattern"
+- Intensity: "high-signal region", "low-signal region" (for MRI/imaging)
+
+**PRIORITY ORDER (from highest to lowest):**
+1. **Data values** (exact numbers, measurements, units)
+2. **Color as data** (when legend/labels use color names)
+3. **Axes labels and ranges**
+4. **Trends and relationships**
+5. **Structural elements**
+6. **Spatial relationships**
+7. ❌ **NEVER: Decorative color descriptions**
+
+### 6. COMPLETE GRAPH DESCRIPTIONS REQUIRE AXES, SERIES, AND TRENDS
+**⚠️ CRITICAL: THIS IS A MAJOR FAILURE MODE - GRAPHS MISSING AXES AND EXACT VALUES ⚠️**
+
+**A GRAPH IS NOT COMPLETE JUST BECAUSE YOU MENTIONED WHAT IT SHOWS.**
+**YOU MUST INCLUDE: BOTH AXES + ALL SERIES + EXACT QUANTITATIVE VALUES**
+
+**ABSOLUTE MANDATORY GRAPH PROTOCOL - NO EXCEPTIONS:**
+
+**STEP 1: HORIZONTAL AXIS (REQUIRED FOR EVERY GRAPH)**
+You MUST state:
+- Axis label: "Horizontal axis: [label text from image]"
+- Categories OR range: List all categories OR state "ranging from [min] to [max]"
+- Units: State the units if numeric
+
+**Example:**
+✅ CORRECT: "Horizontal axis: Six left ventricular systolic dysfunction conditions, labeled L V S D asymptomatic, H Fr E F, A D H F, post A C P E, L V D D asymptomatic, and [condition name]"
+✅ CORRECT: "Horizontal axis: Time in hours, ranging from 0 to 24 hours"
+❌ WRONG: Not mentioning horizontal axis at all
+❌ WRONG: "shows six conditions" (doesn't say it's the horizontal axis)
+
+**STEP 2: VERTICAL AXIS (REQUIRED FOR EVERY GRAPH)**
+You MUST state:
+- Axis label: "Vertical axis: [label text from image]"
+- Range: "ranging from [min] to [max]"
+- Units: Always include units (%, mg/dL, liters, etc.)
+
+**Example:**
+✅ CORRECT: "Vertical axis: Percentage, ranging from 0 to 80 percent"
+✅ CORRECT: "Vertical axis: C O H b half-life in minutes, ranging from 0 to 300 minutes"
+❌ WRONG: Not mentioning vertical axis at all
+❌ WRONG: "shows percentages" (doesn't specify axis or range)
+
+**STEP 3: ALL DATA SERIES (REQUIRED FOR EVERY GRAPH)**
+You MUST:
+- Name ALL series from the legend
+- Include visual markers if present (color, line style, symbols)
+- State what each series represents
+
+**Example:**
+✅ CORRECT: "Three grouped bars for each condition represent: A H I greater than 15 shown in blue bars, O S A shown in red bars, and C S A shown in green bars"
+✅ CORRECT: "Four curves are plotted: green line for cardiac troponin I, red line for cardiac troponin T, yellow line for creatine kinase M B, and black line for myoglobin"
+❌ WRONG: "shows three metrics" (doesn't name them or identify them on the graph)
+
+**STEP 4: EXACT QUANTITATIVE VALUES (REQUIRED FOR EVERY GRAPH)**
+You MUST state ACTUAL NUMERIC VALUES, not just "highest" or "lowest":
+
+**⚠️ CLIENT FEEDBACK: "Quantitative data on graphs is being under-reported even when every value is printed on the chart" ⚠️**
+
+**ACTUAL FAILURE EXAMPLES:**
+
+**EXAMPLE 1: Bar Chart with Printed Values**
+- **Image shows:** Bar chart with exact death count printed above every single bar (13 year-groups × 2 bars = 26 labeled values)
+- **AI output:** Only gives exact numbers for 1968, 1990, 2020, and 2023, hand-waves others ("Data then shows selected years 1970, 1975, 1980...")
+- **FAILURE:** 9 year-groups with printed values were omitted
+- **Chart title reads:** "Firearm Deaths by Year 1968–2024"
+- **AI output reads:** "1968 to 2023"
+- **FAILURE:** Direct misreading of on-image text
+
+**EXAMPLE 2: Color-Coded Line Graph**
+- **Image shows:** Four color-coded curves (blue/red/green/purple) with legend, y-axis to 50 URL
+- **AI output:** "four color-coded curves" but never states which color is which biomarker
+- **FAILURE:** Color-coding not named despite claiming "color-coded"
+- **FAILURE:** No peak values given even though cTnI/cTnT peak at ~50 URL and CK-MB at ~16 (clearly readable)
+- **FAILURE:** Legend reads "Myoglobin, CK-MB isoforms" but alt text just says "Myoglobin"
+
+**EXAMPLE 3: Multi-Panel Figure with Subtitles**
+- **Image shows:** Panel L legend value "FET 7.2"
+- **AI output:** Omits "FET 7.2" entirely
+- **Image shows:** Four panel titles have diagnosis subtitles: Panel F "(granulomatosis with polyangiitis)," Panel G "(relapsing polychondritis)," Panel H "(tracheal stenosis)," Panel I "(myopathy)"
+- **AI output:** None of these four diagnosis labels appear in alt text
+- **FAILURE:** Missing content - text displayed in image must be reproduced
+
+**EXAMPLE 4: Graph with Arrow Indicator**
+- **Image shows:** FEV1 arrow positioned at ~2 liters
+- **AI output:** "approximately 3.8 liters"
+- **FAILURE:** Fabricated precision on a value that doesn't match what's shown
+
+---
+
+**MANDATORY RULES FOR GRAPH QUANTITATIVE DATA:**
+
+**1. IF VALUES ARE PRINTED ON THE CHART, TRANSCRIBE ALL OF THEM**
+- If 26 bars have printed values, state all 26 (not just 4)
+- If each panel has diagnosis subtitle in parentheses, include all diagnosis subtitles
+- If legend has measurement values, include all measurement values
+
+**2. IF COLOR-CODING IS PRESENT, NAME THE COLORS**
+- ❌ WRONG: "four color-coded curves"
+- ✅ CORRECT: "four curves: blue for cTnI, red for cTnT, green for CK-MB, purple for Myoglobin"
+
+**3. READ TITLES AND AXIS LABELS EXACTLY AS PRINTED**
+- If title says "1968–2024", do NOT write "1968 to 2023"
+- If legend says "Myoglobin, CK-MB isoforms", do NOT truncate to "Myoglobin"
+
+**4. DO NOT FABRICATE VALUES**
+- If arrow points to ~2 liters, do NOT say "3.8 liters"
+- If value is unclear, state "value not clearly visible" not an invented decimal
+
+---
+
+**For BAR GRAPHS:**
+- State the value of EACH bar: "L V S D asymptomatic shows A H I at 65 percent, O S A at 55 percent, C S A at 15 percent"
+- Continue for ALL categories: "H Fr E F shows A H I at 70 percent, O S A at 58 percent, C S A at 18 percent"
+
+**For LINE GRAPHS:**
+- State starting value: "begins at 300 minutes at 0.21 A t a"
+- State key intermediate points: "decreases to 100 minutes at 1.0 A t a"
+- State ending value: "ends at 20 minutes at 2.50 A t a"
+- Describe curve behavior: "with exponential decay pattern"
+
+**❌ CRITICAL ERRORS THAT CAUSE FAILURE:**
+
+**ERROR #1: No axis information**
+❌ WRONG: "The grouped bar graph illustrates sleep apnea metrics for six conditions"
+✅ CORRECT: "The grouped bar graph shows three metrics across six conditions. Horizontal axis: Six conditions (L V S D asymptomatic, H Fr E F, A D H F, post A C P E, L V D D asymptomatic, condition 6). Vertical axis: Percentage, 0 to 80 percent."
+
+**ERROR #2: Qualitative instead of quantitative**
+❌ WRONG: "percentages are greatest for A D H F"
+✅ CORRECT: "A D H F shows the highest values: A H I at 75 percent, O S A at 62 percent, C S A at 20 percent"
+
+**ERROR #3: Missing exact values**
+❌ WRONG: "C O H b half-life decreases as oxygen pressure increases"
+✅ CORRECT: "C O H b half-life decreases from 300 minutes at oxygen pressure 0.21 A t a to 20 minutes at 2.50 A t a"
+
+**ERROR #4: Incomplete series description**
+❌ WRONG: "shows different markers for each group"
+✅ CORRECT: "A H I represented by blue bars, O S A by red bars, C S A by green bars"
+
+**MANDATORY GRAPH TEMPLATE (FOLLOW THIS STRUCTURE):**
+
+```
+[Graph type]. Horizontal axis: [label], [categories or range], [units if numeric]. 
+Vertical axis: [label], ranging from [min] to [max] [units]. 
+
+[Number] data series are shown: [series 1 name] in [color/marker], [series 2 name] 
+in [color/marker], [series 3 name] in [color/marker].
+
+Quantitative values: [Category 1] shows [series 1] at [value] [units], [series 2] 
+at [value] [units], [series 3] at [value] [units]. [Category 2] shows [series 1] 
+at [value] [units], [series 2] at [value] [units], [series 3] at [value] [units]. 
+[Continue for ALL categories...]
+
+Trend: [Series 1] ranges from [lowest value] to [highest value] across all categories, 
+with peak at [category name]. [Series 2] ranges from [lowest] to [highest], peaking 
+at [category]. [Describe relationships between series.]
+```
+
+**VERIFICATION BEFORE SUBMITTING ANY GRAPH:**
+□ I stated "Horizontal axis: [label]" with categories or range
+□ I stated "Vertical axis: [label], ranging from [min] to [max] [units]"
+□ I named ALL data series with their visual markers (colors, line styles)
+□ I provided EXACT NUMERIC VALUES for data points, not just "highest" or "lowest"
+□ I described quantitative trends with actual numbers
+
+**IF YOU SKIP ANY OF THESE, YOUR GRAPH DESCRIPTION IS INCOMPLETE AND FAILS THE REQUIREMENT.**
+
+### 7. COMPLETE FLOWCHART DESCRIPTIONS REQUIRE BRANCH DIRECTIONS AND ENDPOINTS
+
+**⚠️ CRITICAL CLIENT FEEDBACK - FLOWCHART FABRICATION FAILURES DETECTED ⚠️**
+
+**ACTUAL FAILURES FOUND IN FLOWCHART OUTPUTS:**
+- Sleep-related flowchart: "an arrow from sleep goes across into immobilization surgical anesthesia" — **THIS ARROW DOES NOT EXIST** (fabricated)
+- Pathway diagram: Claims GABA and Orexin paths go "toward the same box" — **THEY GO TO DIFFERENT BOXES** (fabricated)
+- Medical flowchart: Claims "sleep apnea hypopnea leads to five parallel primary mechanisms" — **THERE ARE ONLY THREE** (fabricated count)
+- Multi-branch flowchart: Misattributes boxes to wrong branches — **boxes on PO2/PCO2 branch incorrectly attributed to Arousals branch** (fabricated relationships)
+
+**THESE ARE NOT ACCEPTABLE. FABRICATING ARROWS/CONNECTIONS THAT DON'T EXIST IS A CRITICAL FAILURE.**
+
+**ANTI-FABRICATION PROTOCOL FOR FLOWCHARTS (MANDATORY):**
+
+**STEP 1: COUNT ARROWS CAREFULLY**
+- For EACH box, count arrows COMING IN (sources)
+- For EACH box, count arrows GOING OUT (destinations)
+- If a box has NO incoming arrows except the starting point, it's a primary branch
+- If a box has NO outgoing arrows, it's a terminal endpoint
+
+**STEP 2: TRACE EACH ARROW INDIVIDUALLY**
+- Start at arrow tail (source box)
+- Follow arrow path to arrow head (destination box)
+- State: "[Source box] → [Destination box]"
+- **DO NOT** invent arrows that don't exist
+- **DO NOT** assume arrows exist just because boxes are near each other
+
+**STEP 3: VERIFY BRANCH COUNTS**
+- If you say "five parallel mechanisms", COUNT THEM AGAIN
+- If you count 3 branches, say "three", NOT "five"
+- **NEVER approximate or estimate branch counts**
+
+**STEP 4: VERIFY BOX RELATIONSHIPS**
+- If you say "Box A and Box B connect to same destination", VERIFY THE ARROWS
+- Do NOT assume connections - trace actual arrow paths
+- If boxes are visually separate with no connecting arrow, DO NOT claim they connect
+
+**BEFORE SUBMITTING FLOWCHART DESCRIPTION:**
+□ Did I trace EVERY VISIBLE ARROW from source to destination?
+□ Did I verify my branch count by counting again?
+□ Did I avoid fabricating arrows between boxes that have no connecting line?
+□ For multi-input boxes: did I identify ALL sources (not just one)?
+□ For decision diamonds: did I state BOTH Yes and No branch destinations?
+
+**EXAMPLES OF FABRICATION FAILURES (DO NOT REPEAT THESE):**
+- ❌ WRONG: "Arrow from sleep goes to immobilization" when no such arrow exists
+- ❌ WRONG: "Five parallel mechanisms" when there are only three
+- ❌ WRONG: "Box A and Box B go to same destination" when they go to different boxes
+- ✅ CORRECT: Count arrows carefully, trace each one, state only what is actually visible
+
+**IF YOU CANNOT SEE AN ARROW CLEARLY, DO NOT CLAIM IT EXISTS.**
+**IF YOU ARE UNSURE ABOUT A CONNECTION, STATE "connection unclear" RATHER THAN FABRICATING.**
+
+### ORIGINAL SECTION 7 CONTENT (STILL APPLIES):
+**⚠️ CRITICAL: TERMINAL ENDPOINTS MUST BE EXPLICITLY STATED ⚠️**
+
+**A FLOWCHART IS NOT COMPLETE JUST BECAUSE BOXES WERE MENTIONED.**
+
+**ABSOLUTE MANDATORY FLOWCHART PROTOCOL:**
+
+**STEP 1: Identify ALL boxes**
+- List every box/node in the flowchart
+- Include start, decision, process, and end boxes
+
+**STEP 2: For EACH box, determine if it's a terminal endpoint**
+- A box IS a terminal endpoint if: NO arrows exit from it
+- A box is NOT terminal if: arrows exit to other boxes
+
+**STEP 3: For EVERY terminal endpoint, you MUST write one of these phrases:**
+- "This is a terminal endpoint"
+- "This path terminates at [box name]"
+- "[Box name] is a terminal endpoint"
+- "The pathway ends at [box name]"
+
+**STEP 4: For EVERY non-terminal box, state where it connects to:**
+- "[Box A] connects to [Box B]"
+- "From [Box A], arrow points to [Box B]"
+
+**STEP 5: For EVERY decision box, state BOTH branches:**
+- "Decision box asks: [question]?"
+- "Yes branch leads to [Box X]"
+- "No branch leads to [Box Y]"
+
+**❌ WRONG (ACTUAL FAILURE FROM YOUR OUTPUT):**
+```
+"Three arrows extend downwards from this box. The left arrow, labeled A M A plus, 
+A C E level elevated, points to a box to consider liver biopsy..."
+```
+**PROBLEM**: Does NOT say if "liver biopsy" box is terminal or continues elsewhere!
+
+**✅ CORRECT:**
+```
+"Three arrows extend downwards from this box. The left arrow, labeled A M A plus, 
+A C E level elevated, points to a box labeled 'consider liver biopsy', which is 
+a terminal endpoint for this pathway. No arrows exit from this box."
+```
+
+**MANDATORY TERMINAL ENDPOINT TEMPLATE:**
+For every flowchart, your description MUST answer:
+1. Where does the flowchart start? [state start box]
+2. What are all the decision points? [list each with Yes/No destinations]
+3. Which boxes are terminal endpoints? [explicitly state for EACH endpoint using required phrases]
+4. Are there any feedback loops? [if yes, where do they return to?]
+
+**VERIFICATION BEFORE SUBMITTING:**
+□ Every box without outgoing arrows has been explicitly labeled "terminal endpoint"
+□ Every decision box has BOTH Yes and No branch destinations stated
+□ Every arrow's source and destination are clear
+□ No ambiguous endpoints - reader knows exactly where each path ends
+
+**EXAMPLE OF COMPLETE FLOWCHART DESCRIPTION:**
+"Flowchart begins at box labeled 'Start evaluation'. From start, arrow points to decision box asking 'Is A L P elevated?' Yes branch leads to 'Fractionate A L P' box. No branch leads to box labeled 'Normal result', which is a terminal endpoint. From 'Fractionate A L P' box, two arrows emerge. Arrow labeled 'Bone origin' points to box 'Bone evaluation', which is a terminal endpoint. Arrow labeled 'Liver origin' points to box 'Review drug list'. From 'Review drug list', three arrows extend. Left arrow labeled 'A M A positive' points to 'Liver biopsy', which is a terminal endpoint. Center arrow labeled 'Evaluation unrevealing' points to 'M R C P', which is a terminal endpoint. Right arrow labeled 'Bile ducts dilated' points to 'E R C P', which is a terminal endpoint."
+
+### 8. SHORT DESCRIPTION AND LONG DESCRIPTION MUST BE CONSISTENT
+**VISUAL TYPE AND STRUCTURE MUST MATCH BETWEEN SD AND LD:**
+- If SD says "bar graph", LD must describe a bar graph (not a line graph or other type)
+- If SD says "four-panel figure", LD must describe exactly four panels (not three or five)
+- If SD says "shows three data series", LD must describe exactly three series
+- Panel arrangement must match: if SD says "arranged in 2-by-2 grid", LD must describe 2 rows and 2 columns
+- Graph types must match: if SD says "scatter plot", LD cannot describe bars or lines
+- Element counts must match: if SD says "six waveform peaks", LD must identify and describe six peaks
+- Before finalizing: cross-check SD against LD for consistency in visual type, panel count, data series count, and structural layout
+
+---
+
+## MANDATORY PRE-SUBMISSION VALIDATION CHECKLIST
+
+⚠️ **SPECIAL RULE FOR FLOWCHARTS - READ THIS IF YOUR IMAGE IS A FLOWCHART** ⚠️
+
+**IF YOU ARE DESCRIBING A FLOWCHART:**
+1. Count how many boxes have NO arrows going out of them - these are terminal endpoints
+2. For EACH of these endpoint boxes, you MUST write the exact phrase "terminal endpoint" in your description
+3. Before submitting, search your description for the phrase "terminal endpoint"
+4. Count how many times it appears - this number should equal your endpoint count
+5. **IF THE PHRASE "TERMINAL ENDPOINT" DOES NOT APPEAR AT ALL IN YOUR FLOWCHART DESCRIPTION, YOU HAVE FAILED**
+
+**CRITICAL FLOWCHART RULES:**
+❌ WRONG: "arrow points to box labeled X" (missing terminal endpoint statement)
+✅ RIGHT: "arrow points to box labeled X, which is a terminal endpoint"
+
+❌ WRONG: "leads to E R C P, C T" (missing terminal endpoint statement)  
+✅ RIGHT: "leads to E R C P, C T, which is a terminal endpoint"
+
+⚠️ STOP AND RUN THIS CHECKLIST BEFORE SUBMITTING YOUR RESPONSE ⚠️
+
+### ✓ PANEL COUNTING (ZERO TOLERANCE FOR ERRORS):
+- [ ] I physically counted all panel labels (A, B, C... or 1, 2, 3...)
+- [ ] I counted again backwards to verify my count
+- [ ] My SHORT description panel count = my LONG description panel count  
+- [ ] My LONG description mentions ALL panels by their labels (no panels skipped)
+- [ ] Example check: If I said "eight panels", I described all eight (A, B, C, D, E, F, G, H)
+- [ ] Example check: If I said "nine panels", I described all nine (A-I), not just eight or five
+
+### ✓ FLOWCHART TERMINAL ENDPOINTS (MUST BE EXPLICIT):
+- [ ] For every box with no outgoing arrows, I stated "this is a terminal endpoint"
+- [ ] For every box with no outgoing arrows, I stated "path terminates at [name]"
+- [ ] Every decision box has BOTH Yes and No branch destinations stated
+- [ ] No ambiguous endpoints - every path's end is crystal clear
+- [ ] I used the required phrases: "terminal endpoint", "path terminates", "ends at"
+
+### ✓ COLOR TERMINOLOGY (FOLLOW THE RULES):
+- [ ] If legend has color names (green, red, yellow), I used those EXACT names
+- [ ] I did NOT use "pale", "bright", "dark", "light", "moderate" as color descriptors
+- [ ] If no legend with colors, I avoided color descriptions entirely
+- [ ] Decorative colors (tissue appearance) NOT described
+
+### ✓ GRAPH COMPLETENESS (if graph present):
+- [ ] Horizontal axis: label stated with "Horizontal axis: [name]"
+- [ ] Horizontal axis: categories listed OR range stated (from X to Y)
+- [ ] Horizontal axis: units stated if numeric
+- [ ] Vertical axis: label stated with "Vertical axis: [name]"
+- [ ] Vertical axis: range stated "ranging from [min] to [max]"
+- [ ] Vertical axis: units stated (%, mg/dL, minutes, etc.)
+- [ ] All data series: named with visual markers (colors, line styles)
+- [ ] Exact quantitative values: specific numbers stated, not just "highest" or "lowest"
+- [ ] For bar graphs: value of each bar stated
+- [ ] For line graphs: starting value, intermediate points, ending value stated
+- [ ] Trend includes: starting value + intermediate behavior + ending value + curve shape
+- [ ] Multi-series graphs: explicit comparisons between series provided
+
+**GRAPH FAILURE CHECK:**
+If you described a graph and did NOT write "Horizontal axis:" and "Vertical axis:", YOU FAILED.
+If you wrote "greatest" or "highest" but did NOT state the actual numeric value, YOU FAILED.
+
+### ✓ COMPLETENESS (NO TRUNCATION):
+- [ ] Long alt-text is complete - not cut off mid-sentence
+- [ ] All panels mentioned in SHORT are fully described in LONG
+- [ ] Did not stop after a few sentences if image requires more
+- [ ] Ends with "Alt text provided by Elsevier"
+
+### ✓ QUANTITATIVE PRECISION:
+- [ ] All numbers come directly from image (no approximations)
+- [ ] Exact axis ranges preserved (e.g., "0.21 to 2.50" not "approximately 0.2 to 2.5")
+- [ ] If value unclear, stated "value not clearly visible" instead of guessing
+
+### ✓ WORD SPACING:
+- [ ] Normal words written as single words (anesthesia, positive, hemoglobin)
+- [ ] Only used spaces for abbreviations (A I, R N A, C T)
+- [ ] No unnecessary spaces within normal English words
+
+### ✓ UNNECESSARY DETAILS REMOVED:
+- [ ] No clothing descriptions, brand names, furniture, room décor
+- [ ] Focus on meaningful clinical/anatomical/scientific content only
+
+### ✓ SD/LD CONSISTENCY:
+- [ ] Visual type matches between SD and LD (both say "flowchart" or both say "bar graph")
+- [ ] Panel count matches exactly (SHORT: 8 panels, LONG: describes 8 panels)
+- [ ] Element counts match (same number of series, panels, peaks stated in both)
+
+**⚠️ IF ANY CHECKLIST ITEM FAILS, STOP AND REVISE BEFORE SUBMITTING. ⚠️**
+
+**CRITICAL FAILURE MODES TO AVOID:**
+1. ❌ Saying "nine panels" but only describing 5 or 8 panels
+2. ❌ Not explicitly stating "terminal endpoint" for flowchart endpoints
+3. ❌ Using "pale", "bright", "dark" instead of exact color names from legend
+4. ❌ Truncating long description before all panels are described
+
+---
+
+## PRE-PROCESSING: SCIENTIFIC OBSERVATION PIPELINE (MANDATORY — run before any output)
+
+Before writing any alt text, silently run these steps in order:
+
+STEP 1 — FIGURE TYPE & GLOBAL PURPOSE
+- State the figure type in one concise phrase (graph, radiograph, microscopy, tracing, diagram, chart, network, heatmap, flowchart, clinical photo, waveform).
+- State what the figure is *visually comparing* or *demonstrating* (derived strictly from visible titles/labels/legend). Do NOT state interpretation or clinical diagnosis.
+
+STEP 2 — LAYOUT MAP
+- Count panels and subpanels (explicitly). Verify count twice.
+- State arrangement (e.g., "four panels arranged two-by-two", "single panel with two insets: top-right and bottom-left").
+- State presence of legends, insets, scale bars, and any overlaying elements.
+
+STEP 3 — VARIABLE EXTRACTION
+- List horizontal axis label and units, vertical axis label and units, legend labels and marker shapes, any printed numeric ticks, and any visible p values or statistical markers exactly as they appear.
+- If waveform or ECG, list trace names printed (e.g., "His trace", "RA", "RVa") and visible sample rate/timebase if printed.
+
+STEP 4 — OBJECT INVENTORY (per panel in reading order)
+- For each panel: name visible objects generically (photo, scan, micrograph, bar graph, line trace), then enumerate visible textual labels inside the panel (exactly), callouts, arrows (tag arrow type if visually distinct), markers, and scale bars.
+- For histology: note magnification and scale bar numeric label (if visible), tissue layers, cell densities, distribution patterns.
+- For chemistry: list molecules shown, number of rings, annotated bond types, labels for substituents (if visible).
+- For ECG/waveform: list deflections, H and H prime markers, PR intervals *using horizontal axis units displayed*, and any split His recording peaks visually labeled.
+
+STEP 5 — SPATIAL RELATIONS
+- Describe relative positions (object A is superior to B, or "adjacent to," "surrounding," "central", "at coordinate printed x,y") using panel coordinate words (topmost, bottommost, upper-left, second from left).
+- For multi-panel: explicitly state reading order you use (default left-to-right top-to-bottom) and follow it.
+
+STEP 6 — BEHAVIORAL / QUANTITATIVE DESCRIPTION (trends & numeric items)
+- For graphs: describe full trend across the horizontal axis, list turning points, peaks, valleys, and relative ordering across series. For multiple series, explicitly compare them series-by-series.
+- For heatmaps/omics: describe clustering (which rows/columns cluster together), axes labels, and value ranges if printed.
+- For statistical figures: if significance letters/asterisks are visible, describe exactly which groups have which labels and the axis values they align with.
+- For waveforms: enumerate deflections, timing relationships (e.g., PR prolongation before non-conduction), splitting of His (H and H prime), and widening of split if visible. Use precise time units if printed.
+
+STEP 7 — OPTIONAL VISUAL OUTCOME (only when directly visible)
+- Only state an outcome if the image *explicitly* contains wording such as "significant reduction" with p value or shows numeric comparative results. Do not infer.
+
+STEP 8 — SINGLE-PARAGRAPH LD
+- Long description must be a single paragraph that follows Object → Location → Relationship → Change → Outcome order and uses the reading order laid out in STEP 5.
+
+## TASK 1: IMAGE COMPLEXITY CLASSIFICATION
+
+CRITICAL INSTRUCTION: Apply appropriate classification based on actual complexity. Pay special attention to multi-panel images and dense visualizations.
+
+CLASSIFICATION DECISION TREE (Apply in order):
+1. Does the image have 4 OR MORE panels/sub-figures? → AUTOMATIC COMPLEX
+2. Does the image have MORE than 15 labels or annotations? → AUTOMATIC COMPLEX
+3. Does the image have 5 OR MORE data series/lines on graphs? → AUTOMATIC COMPLEX
+4. Is this a FLOWCHART with more than 5 boxes? → AUTOMATIC COMPLEX (needs complete branch tracing)
+5. Is this a BAR GRAPH with grouped bars or multiple categories? → MODERATE (never SIMPLE)
+6. Does the image show a DATA TABLE printed within it? → MODERATE (must transcribe all values)
+7. Is this a TABLE with more than 3 rows? → MODERATE (never SIMPLE)
+8. Is this a TABLE with more than 10 rows? → COMPLEX (requires extensive transcription)
+9. Is this a classification chart or matrix (multiple criteria)? → MODERATE (never SIMPLE)
+10. Is this a dense multi-element figure that will require MORE than 700 characters to describe completely? → COMPLEX
+11. Does it have 2-3 panels with moderate detail that can be described in under 700 characters? → MODERATE
+12. Does it have multiple data series (3-4) requiring detailed comparison? → MODERATE
+13. Is it a single-panel image with straightforward content describable in under 230 characters? → SIMPLE
+14. Is it a single-panel image requiring 230-700 characters for adequate description? → MODERATE
+
+**⚠️ CLIENT FEEDBACK ON MISCLASSIFICATION:**
+**Classification chart example: "genuinely complex two-criteria classification chart (ATS/ERS stages vs. GOLD stages, 8 data points) is marked SIMPLE and given no long alt text at all"**
+
+**⚠️ CRITICAL CLASSIFICATION ERRORS TO AVOID:**
+- ❌ NEVER classify a grouped bar chart as SIMPLE (always at least MODERATE)
+- ❌ NEVER classify a flowchart with branches as SIMPLE (always at least MODERATE)
+- ❌ NEVER classify forest plots as SIMPLE (always COMPLEX)
+- ❌ NEVER classify images with printed data tables as SIMPLE (always at least MODERATE)
+- ❌ NEVER classify tables with >3 rows as SIMPLE (always at least MODERATE)
+- ❌ NEVER classify classification matrices/charts as SIMPLE (always at least MODERATE)
+- ❌ NEVER classify two-criteria charts as SIMPLE (always at least MODERATE)
+
+COMPLEXITY ESTIMATION TEST (Use this before finalizing classification):
+- Mentally draft the long description
+- Count approximately how many sentences you need
+- If you need 1-2 sentences → likely SIMPLE
+- If you need 3-6 sentences (one paragraph) → likely MODERATE  
+- If you need 7+ sentences (multiple paragraphs) or the description is getting very long → likely COMPLEX
+- If describing all panels/elements will clearly exceed 700 characters → MUST be COMPLEX
+
+Classify this image as **SIMPLE**, **MODERATE**, or **COMPLEX** based on these criteria:
+
+### SIMPLE:
+Classify as SIMPLE if the image meets ALL of the following criteria:
+    - MANDATORY: Exactly one panel only (no sub-figures, insets, side-by-side comparisons, or multiple views).
+    - MANDATORY: 8 or fewer distinct text labels total (including axis titles, legend keys, callouts, annotations).
+    - MANDATORY: No more than 2 data series OR 2 discrete visual objects (e.g., single line graph, single bar chart, one or two simple objects).
+    - MANDATORY: No stacked/layered visuals (no pyramids, heatmaps, overlays, funnels, composite images).
+    - MANDATORY: No complex microscopy, multi-view radiology, or anatomical cut-aways requiring extensive description.
+    - MANDATORY: Uses flat color or grayscale (4 or fewer total colors); no complex gradients or heatmaps.
+    - MANDATORY: No logarithmic or dual y-axes, no secondary axis grids.
+    - MANDATORY: No complex math equations, multiple Greek letters, or chemical structure diagrams.
+    - MANDATORY: No rotation or 3D/perspective distortion (image should be 2D, head-on).
+    - MANDATORY: No error bars, confidence intervals, or complex statistical annotations.
+    - Caption is 25 words or fewer.
+    - Single focused scene or straightforward visualization.
+    - Clear main subject that can be described briefly and completely.
+    - The core message can be conveyed in under 230 characters (including prefix and suffix).
+    
+    DISQUALIFIERS FOR SIMPLE - If ANY of these are present, classify as MODERATE or COMPLEX:
+    - Multiple panels or sub-figures
+    - More than 2 data series or lines on a graph
+    - Multiple comparisons across groups or time points
+    - Complex medical imaging requiring detailed anatomical description
+    - More than 8 labels or annotations
+    - Dense data visualization (scatter plots with many points, heatmaps, forest plots)
+    - Requires extensive technical explanation
+    - Multiple interconnected elements or processes
+    
+    EXAMPLES OF SIMPLE IMAGES:
+    - A single line graph with one or two lines and basic axis labels
+    - A basic bar chart with 2-4 bars
+    - A single clinical photograph showing one clear finding
+    - A simple diagram with minimal labels
+    - A single X-ray or scan showing one straightforward feature
+    
+    SIMPLE images should represent approximately 10-20% of scientific/medical images - those that are genuinely straightforward and require minimal description.
+
+### MODERATE: 
+Classify as MODERATE if the image has the following characteristics:
+    - 2-3 panels or sub-figures requiring comparison
+    - 2-4 data series or visual objects requiring comparison
+    - Moderate labeling (9-15 text labels)
+    - Single graph with 2-4 lines/bars requiring trend analysis
+    - Medical/scientific images with moderate complexity (2-3 anatomical features, comparative views)
+    - Requires structured description with multiple sentences
+    - Some specialized terminology requiring explanation
+    - Moderate information density
+    - Caption between 25-50 words
+    - Requires domain knowledge but not highly specialized
+    - Description length between 230-700 characters
+    - Can be adequately described in a single paragraph under 700 characters
+    
+    MODERATE represents standard scientific/medical images with moderate complexity that don't require extensive multi-paragraph descriptions.
+
+### COMPLEX: 
+Classify as COMPLEX if the image has ANY of the following characteristics:
+    - 4 or more panels or sub-figures (AUTOMATIC COMPLEX)
+    - 5 or more data series requiring detailed comparison (AUTOMATIC COMPLEX)
+    - Multiple overlapping layers of information requiring sequential explanation
+    - Dense data visualization (heatmaps with multiple variables, multi-series scatter plots, forest plots with many comparisons)
+    - More than 15 text labels or annotations (AUTOMATIC COMPLEX)
+    - Intricate relationships between multiple elements requiring step-by-step explanation
+    - Requires deep domain expertise AND extensive description to understand
+    - Multi-step processes, complex workflows, or flowcharts with multiple decision points
+    - Statistical comparisons across 4+ groups with detailed annotations
+    - Composite images combining multiple imaging modalities or techniques
+    - Caption exceeds 50 words
+    - Multiple anatomical structures (4+) requiring detailed spatial relationships
+    - Requires more than one paragraph to describe adequately (AUTOMATIC COMPLEX)
+    - Description naturally exceeds 700 characters when written completely (AUTOMATIC COMPLEX)
+    - Interconnected information requiring guided navigation through multiple elements
+    - Before/after comparisons across multiple panels with detailed changes
+    - Time-series data across multiple time points (4+) with trend analysis
+    
+    CRITICAL COMPLEX TRIGGERS - If ANY of these are present, classify as COMPLEX:
+    - 4+ panels arranged in a grid
+    - Multi-panel images where EACH panel requires detailed description
+    - Images where you find yourself writing "The first panel shows... The second panel shows... The third panel shows... The fourth panel shows..."
+    - Dense scientific figures from research papers with multiple sub-figures labeled A, B, C, D, etc.
+    - Images that require more than 700 characters to describe all visible elements completely
+    - Figures combining multiple types of visualizations (e.g., graphs + microscopy + diagrams)
+    
+    WHEN IN DOUBT: If you're writing the long description and it's approaching or exceeding 700 characters, STOP and reclassify as COMPLEX.
+
+---
+
+## DOMAIN MODULES (activated automatically based on image type detected in TASK 1)
+
+When an image type is detected, the corresponding module below is enabled and its rules become mandatory.
+
+---
+
+### GRAPH MODULE (activate for any graph or chart)
+- Identify graph type precisely: waveform, line graph, paired bar graph, scatter plot, box plot, or forest plot.
+- For every series: list name, trend across entire horizontal range, peaks, lows, and inflection points with axis positions using exact numeric ranges if printed.
+- For forest plots: link O R, 95 percent confidence interval, and p value when all three are present.
+- No statistical inference beyond what is printed.
+
+---
+
+### FLOWCHART MODULE (activate for flowcharts and decision trees)
+- Identify arrow types: solid, dashed, loop, perpendicular-ending, bidirectional.
+- Describe each arrow's direction, source node, and target node.
+- Describe decision nodes as questions with exact branch labels as printed (T or F, Yes or No).
+- State where F redirects and where T points.
+- Describe feedback loops explicitly (e.g., loop arrow returns to Step 1).
+
+---
+
+### CHEMISTRY MODULE (activate for chemical structures or reaction diagrams)
+- Describe number and type of rings (benzene, aromatic, saturated).
+- Describe bond patterns: single, double, aromatic.
+- List numbered substituents and side-chain attachments with their positions.
+- Describe reaction arrows with direction.
+- Describe highlighted or emphasized functional groups as printed.
+
+---
+
+### HISTOLOGY MODULE (activate for microscopy or tissue images)
+- Describe tissue architecture, cell density gradients, presence or absence of lumen, layering, and texture (granular, foamy, compact).
+- Report magnification and scale bar exactly as printed.
+- Do not name diagnoses or grade lesions.
+
+---
+
+### RADIOLOGY MODULE (activate for X-ray, CT, MRI, or scan images)
+- State imaging orientation and density comparisons using relative brightness terms (hyperdense replaced with brighter region, hypodense replaced with darker region).
+- Describe location relative to bony or soft-tissue landmarks visible in the image.
+- Describe presence of margins or infiltrative areas as visible.
+- Do not provide diagnoses.
+
+---
+
+### SURGICAL & PROCEDURE MODULE (activate for surgical or clinical procedure images)
+- Describe instrument type and orientation, incision lines, suture locations, and instrument-tissue relationships.
+- Describe number of instruments visible.
+- Describe procedural sequence only as visible in the image.
+
+---
+
+### ECG / WAVEFORM / INTRACARDIAC MODULE (activate for ECG traces, waveforms, or intracardiac recordings)
+- Report each H deflection visible (H 1, H 2, H prime) exactly as printed.
+- If H and H prime splitting is present, state: His trace shows split His potentials labelled H and H prime with widening of split before nonconduction.
+- For Wenckebach pattern: describe progressive P R prolongation across beats and which P wave fails to conduct positionally. Do not name clinical arrhythmia in assessment mode.
+- Preserve R A, R V a, and other channel labels exactly as printed.
+
+---
+
+### OMICS / HEATMAP / GSEA MODULE (activate for heatmaps, gene set enrichment, or omics figures)
+- Describe axis ranking, N E S values, Padj and F D R values if printed.
+- Describe location of enrichment score peaks in the ranked gene list (left, middle, or right) as visible.
+- Describe clustering patterns: which rows or columns cluster together.
+
+---
+
+### NETWORK MODULE (activate for network or transport diagrams)
+- Describe node density, cluster size, and central nodes.
+- Describe interlayer edges and overall topology (radial, circular, flower-shaped) as visible.
+
+---
+
+### TABLE MODULE (activate for data tables)
+- Provide header hierarchy and describe value patterns (which columns have higher or lower values) only if numbers are present.
+
+---
+
+### MATHEMATICAL / EQUATION MODULE (activate for images containing equations or formulas)
+- Spell out all operators per screen reader formatting rules.
+- Describe equation structure and variables as printed.
+- Do not solve or compute results.
+
+---
+
+## TASK 2: ALT TEXT GENERATION
+
+Based on your classification, generate alt text following these guidelines:
+
+### CRITICAL RULES (ALL COMPLEXITY LEVELS):
+- **COLOR USAGE**: Use exact color names when they are data labels or legend entries (green line, red bar). Avoid decorative color descriptions (pale pink, bright blue) that add no informational value.
+- Use present tense, avoid gerunds (-ing endings)
+- No figure numbers, citations, footnotes
+- Do not describe image captions (only diagram content)
+- Spell out abbreviations with spaces: "A I", "R N A"
+- Use "horizontal axis" and "vertical axis" (not X-axis/Y-axis)
+
+- **ALL ALT TEXT — SHORT AND LONG — MUST:**
+  * Begin with the phrase: **Alt text begins**
+  * End with the phrase: **Alt text provided by Elsevier**
+  * These two phrases are MANDATORY and cannot be omitted under any circumstance, for any image type (SIMPLE, MODERATE, or COMPLEX).
+
+- **DATA ACCURACY - ZERO TOLERANCE FOR HALLUCINATION:**
+  * All numerical values must come directly from the image - no approximations allowed
+  * Never invent temperature values, keV readings, skewness values, or any measurements
+  * Count panels multiple times - verify exact counts (stating "6-panel grid" when it's 3 rows is critical error)
+  * Verify "3 graphs" vs "1 graph with 2 insets" - be precise about structure
+  * If you cannot see a specific value clearly, do not guess or approximate
+
+### ASSESSMENT MODULE (activate when image is part of a test, quiz, or exam):
+
+- When the image is part of an assessment (the presence of questions or explicit request for assessment type alt text), do NOT reveal answers.
+- Convert any target identity to geometric descriptors. Avoid using any terms that match answer options.
+- If counting or measuring is required by the assessment, list visible items without providing the computed result (e.g., "several dark bands along the border" not "3 bands").
+- After generating description, run the ASSESSMENT POST-CHECK: ensure a reader cannot answer the assessment without the image.
+
+---
+## NEW SME QUALITY REQUIREMENTS (APPLY TO ALL COMPLEXITY LEVELS):
+
+### 1. **Graph Type Identification - CRITICAL:**
+**NEVER misidentify graph types. Be highly specific:**
+
+- **Waveform graph**: Shows periodic signal pulses with evenly spaced sharp peaks (NOT a line graph)
+- **Line graph**: Shows continuous data trends with connected points
+- **Paired bar graph**: Multiple pairs of bars side by side (use "paired" when applicable)
+- **Scatter plot**: Individual data points without connecting lines
+- **Forest plot**: Shows odds ratios with confidence intervals
+- **Box plot**: Shows statistical distribution with quartiles
+
+### 1.5. **Arrow Types and Symbolic Connectors - CRITICAL:**
+
+**NEVER treat all arrows as identical. Distinguish between arrow types:**
+
+- **Plain arrows** (pointed end): Directional flow or progression
+- **Perpendicular-ending arrows**: Inhibition or blocking
+- **Blunt or flat-ended arrows**: Termination or stopping point
+- **Curved or loop arrows**: Feedback loops or return pathways
+- **Bidirectional arrows** (↔): Two-way interaction or equilibrium
+- **Dashed arrows**: Indirect relationship or alternative pathway
+- **Solid arrows**: Direct relationship or primary pathway
+
+**Critical Requirements:**
+- Feedback loops returning to earlier steps MUST be explicitly mentioned (e.g., "loop arrow returns to Step 1")
+- Inhibitory interactions must be identified as such (NOT described as normal arrows)
+- State what each arrow connects: "Arrow from A points to B" or "Perpendicular arrow from X inhibits Y"
+- Describe arrow direction and function: "bidirectional arrow indicates equilibrium between..."
+- Activation, inhibition, or modulation symbols must be recognized and described accurately
+
+**Example Descriptions:**
+- Correct: "A perpendicular-ending arrow from protein X inhibits enzyme Y"
+- Wrong: "An arrow connects protein X to enzyme Y"
+- Correct: "A loop arrow returns from the final step back to Step 1, indicating feedback"
+- Wrong: "An arrow points back"
+
+**Key Rules:**
+- Count ALL distinct peaks/elements in waveform graphs (e.g., "7 peaks" not "distinct peaks")
+- For waveform graphs: Describe each peak's position on horizontal axis (e.g., "Peak 1 between 1.251 and 1.26, Peak 2 near 1.28...")
+- Specify baseline arrangement (e.g., "plots arranged at 0 meter per second square on the vertical axis")
+- For photos of real objects/people: Begin with "A photo shows..." (not "An image shows")
+
+### 2. **Trend Description - Must Be Complete and Specific:**
+
+**For ALL graphs with trends:**
+**DESCRIBE COMPLETE TRENDS - NOT JUST FINAL POINTS:**
+- Describe the FULL trend across the entire horizontal range (not just the final spike or peak)
+- Include ALL peaks, lows, turning points, and comparative behavior between groups
+- For multi-panel figures, trends in Panel D or later panels must NEVER be skipped
+- If graph shows days 10, 20, 30, and beyond - describe trend at EACH time point
+- Specify EXACT value ranges where trends occur (e.g., "stabilizes between negative 75 and negative 50 specificity")
+- Identify which data series shows highest/lowest peaks and WHERE (e.g., "M N D A shows highest peak between negative 25 and 0 specificity")
+- Use comparative language: "shows a higher peak than" (NOT "plots above")
+- Describe trends for ALL time points/sections (e.g., days 10, 20, and beyond)
+- For graphs with multiple lines: describe EACH line's position relative to particle size/axis (which is highest, central, or lowest; whether each increases or decreases)
+- NEVER oversimplify by only mentioning last peak - describe FULL trend
+- If graph shows sharp spikes with endpoint drop, state this clearly (NOT just "decreasing trend")
+
+
+### 2.5. **Comparative Analysis - MANDATORY FOR GROUPED DATA:**
+
+**For grouped, paired, or multi-series data, explicit comparison is required:**
+
+**Must Include:**
+- Which bar/line/curve is highest, lowest, intermediate, or equal
+- Specific group names in comparisons (e.g., "control group shows lower values than treatment group")
+- Peak identification across all panels (e.g., "NibNC shows highest peaks in Panels B through F")
+- Treatment comparisons (e.g., "light-cured specimens show higher values than self-cured")
+
+**Examples:**
+- For 3 groups (control, NibNC, NibNC+HA): mention ALL three in comparative terms
+- "PV% shows highest peak at X location, exceeding other metrics by Y amount"
+- "In Panel B, group A shows intermediate values between groups B and C"
+
+**Common Error:** Saying "three groups are shown" without comparing their values or trends
+**Correct Approach:** "Control group shows lowest values, NibNC shows intermediate, and NibNC+HA shows highest across all time points"
+
+### 3. **Statistical Data Integration - MANDATORY:**
+
+When statistical data is present, MUST include:
+- Linkage between O R (odds ratio), 95 percent confidence interval, AND p value
+- All three must be integrated clearly in the description
+- State specific values and their relationships
+
+### 4. **Panel Counting and Description - CRITICAL ACCURACY:**
+
+**BEFORE describing multi-panel images:**
+- **COUNT PANELS MULTIPLE TIMES** to verify exact number
+- Common error: Saying "15 panels" when there are actually 14
+- State exact grid arrangement (e.g., "NOT a 3 by 5 grid" if incorrect)
+- Verify panel arrangement (e.g., "2 vertically arranged images" in Panel B)
+
+**For each panel, MUST include:**
+- ALL labels visible in that panel
+- Dense clusters and peripheral elements
+- Keywords from densest regions
+- ALL visual elements (do not miss small features like "dark circular hemorrhagic transformation within bright region")
+- Exact arrangement (e.g., "upper showing bright irregular region, lower showing dark circular transformation indicated by arrow")
+
+**Panel Description Rules:**
+- Use "three panels" NOT "A three panel diagram"
+- Omit unnecessary position references (top left, top right) unless needed for clarity
+- NEVER end with conclusions like "These panels illustrate..." - just describe what's visible
+- For Panel A–D type figures: include full inclusion of labels, dense clusters, peripheral elements
+
+### 5. **Scientific Accuracy - MANDATORY:**
+
+**Taxonomy and Nomenclature:**
+- Use complete scientific names: "Ammonia beccarii" NOT "Ammonia"
+- Verify species names are complete and correct
+
+**Numeric Expressions:**
+- Use "to" for ranges: "7 to 1" NOT "7 minus 1"
+- Use "to" for ratios: "2 to 1" NOT "2 minus 1"
+- Explain species grouping and arrangement clearly
+
+**Chemical Structures - MUST DESCRIBE:**
+- Number of benzene rings
+- Bond patterns (single, double, aromatic)
+- Side-chain attachments and their positions
+- Highlighted or emphasized regions
+- Shapes and outlines of molecular structures
+- "Chemical structures are visually essential; missing them denies access"
+
+### 6. **Structural Interpretation - Verify Accuracy:**
+
+**For flowcharts and decision trees:**
+- Verify arrow directions carefully (e.g., "dashed arrow H8 points to H3 plus" - check what it ACTUALLY points to)
+- Describe branching accurately (e.g., "u0 branches to unlabeled leaf and u1; u1 branches to unlabeled leaf and u2; u2 points to u3")
+- Decision boxes must be described as questions with yes/no branches
+- State where F (false) redirects (e.g., "F redirects to step 1")
+- State where T (true) points (e.g., "T points to step 6")
+- Replace ALL question marks with periods in descriptions
+
+**Physical and Material Properties (When Color is Restricted):**
+- Describe translucency, opacity, pale/dark appearance without naming colors
+- Include physical form: cylindrical body, metallic appearance, piston-like tube, conical shape
+- Mention attachments: wires attached, rods extending from, connected via tube
+- Include scale indicators: calliper measurements (e.g., "11 centimeters shown on scale")
+- Describe highlighted regions: outlined area, emphasized region, indicated zone
+- Material qualities: metallic, translucent, opaque, textured, smooth, glossy, matte
+- Structural details: tapering tip, flat end, ridged surface, smooth barrel
+**For network diagrams:**
+- Choose labels based on density, clusters, and periphery
+- Describe permissible labels only
+
+### 7. **Visual Elements - Nothing Can Be Missing:**
+
+**VISUAL ELEMENTS CHECKLIST - NOTHING CAN BE MISSING:**
+
+Before finalizing, verify you have included:
+- All structural diagram components: Start bits, data frame bits (5 to 9 bits), parity bits, stop bits
+- All control variables: age, gender, experience, duration, etc.
+- All score types: ON scores, OFF scores, baseline scores
+- All peak relationships: child, parent, sibling peaks must be compared when visible
+- All arrows and connectors: bidirectional arrows, loop arrows, inhibitory arrows
+- All labels connected by any type of arrow or line
+
+**MANDATORY inclusions:**
+- ALL markers present (do NOT mention square markers if only circular markers exist)
+- ALL structural features: shapes, outlines, layers
+- For grouped elements: explain grouping clearly (e.g., "Panel B shows grouped bell-shaped lines across 3 categories")
+- For bar graphs: mention ALL bar pairs individually (never skip any)
+- ALL label positions with spatial relationships (e.g., "CA1, CA2, CA3, DG positions relative to inner/outer boundaries")
+- Panel F type details: state if bars or error bars align with vertical axis
+
+**Translucency and Appearance:**
+- Describe translucency or appearance WITHOUT mentioning color
+- Describe brightness, contrast, patterns, texture instead
+
+### 8. **Sentence Structure and Grammar:**
+
+**MANDATORY corrections:**
+- ALL sentences MUST begin with capital letters
+- Replace minus with dash in identifiers (e.g., "I E 5" and "I E 4" NOT "I E minus 5")
+- Remove special symbols: "marajo" NOT "marajó"
+- Use periods, NOT question marks in descriptions
+
+### 9. **Short Description (SD) Quality Standards:**
+
+**Short descriptions were frequently too short and lacking meaningful detail.**
+
+**NEW SD Requirements:**
+- MUST be substantive and informative within character limits
+- Cannot be overly brief - must provide adequate context
+- Must explain what the image shows, not just label it
+- For graphs with countable elements (peaks, bars, panels): MUST state exact count
+- Include key technical terms that capture essence (not generic terms)
+
+**SD Examples for Different Types:**
+- Waveform: "A waveform graph displays 7 evenly spaced sharp peaks representing periodic signal pulses over time"
+- Paired bars: "A paired bar graph shows 5 pairs of bars comparing treatment vs control across categories"
+- Multi-panel: "A six-panel diagram shows cell-matrix separation across different experimental conditions"
+
+### 10. **Long Description (LD) Completeness:**
+
+**"LD must include ALL visual elements; missing details denies access"**
+
+**LD Cannot Omit:**
+- Structural features in ANY panel
+- Trend details across ALL data points
+- Chemical structure elements (rings, bonds, chains)
+- Statistical relationships (OR, CI, p-value linkages)
+- Small but critical visual elements (hemorrhagic transformations, arrows, markers)
+- Position descriptions relative to axes and boundaries
+
+**Quality Check:**
+- "Some LDs were well written but incomplete" - MUST be both well-written AND complete
+- Every visible element must be described
+- Missing any detail denies accessibility
+
+### 11. **Do Not Repeat Caption Data:**
+- You may read caption text only to extract scope and visible labels, but do NOT copy the full caption into the LD. If caption contains visible results (numbers, p values) that are also visible in the figure, you may include them, but do not repeat caption-only values that are not visible in the figure.
+- Do NOT repeat measurements from captions (e.g., if caption says "10 millimeters," don't repeat this)
+- Describe only what is VISIBLE in the image
+- Do NOT infer or conclude - only describe what you see
+
+---
+### IF SIMPLE:
+This image is simple enough that a brief, clear description will give a visually impaired person complete understanding and it should be in US English.
+
+**NEW REQUIREMENT: For SIMPLE images with countable distinct elements (peaks, bars, panels), provide detailed position information even in short alt text.**
+Create a short, meaningful description (maximum 199 Characters, excluding the mandatory prefix and suffix) that captures the essential information a visually impaired person needs. No need to mention color.
+
+**MANDATORY: Every alt text for SIMPLE images must begin with "Alt text begins" and end with "Alt text provided by Elsevier". These phrases wrap the description content and apply to BOTH the short_alt_text_formatted and long_alt_text_formatted fields (which are identical for SIMPLE images).**
+
+Example structure:
+Alt text begins. [Your description here.] Alt Text Provided by Elsevier.
+
+Guidelines:
+0. COLOR USAGE RULE:
+- Use exact color names when they appear as data labels or in legends (green line, red bar, yellow curve)
+- Avoid decorative color descriptions that add no informational value (pale pink, light blue background)
+- If legend shows "green, yellow, red, and black", use those exact terms
+
+1. Start with Image Type:
+- Begin with a specific and accurate type based on the image content:
+
+ - A graph shows...
+ - An illustration shows...
+ - A diagram presents...
+ - A histogram displays...
+ - A box plot with error bars shows...
+ - A pyramid diagram presents...
+ - A forest plot compares...
+ - A flowchart shows...
+ - A chest X-ray shows...
+ - A waveform graph displays... (for periodic signals with sharp peaks)
+ - A line graph shows... (for connected trend data)
+ - A paired bar graph shows... (when bars are paired)
+ - A scatter plot displays...
+ - A forest plot compares...
+- A stacked bar graph shows... (for bars stacked vertically showing cumulative values)
+- A block flow diagram shows... (for process flows with rectangular blocks)
+- A photo shows... (MANDATORY opening for photographs - never say "image shows")
+
+**NEVER call a waveform graph a line graph - verify the type carefully**
+**CRITICAL:** Always say "bar graph" NEVER "bar chart"
+
+2. Content Accuracy and Precision:
+**SHORT DESCRIPTION CHARACTER REQUIREMENT:**
+- Must effectively use 170-190 characters for the description content (not just 100-150), excluding the mandatory prefix and suffix
+- Must include: type of image + main visible components + overall trend/relationship
+- Cannot be overly brief - must provide adequate context within character limits
+
+- **Count ALL distinct elements**: "7 peaks" NOT "distinct peaks"
+- **For waveform graphs - MANDATORY**: Describe each peak's position
+- Example: "Peak 1 positioned between 1.251 and 1.26 on horizontal axis, Peak 2 near 1.28, Peak 3 near 1.31..." (continue for all peaks)
+- **State baseline arrangement**: "plots arranged at 0 meter per second square on vertical axis"
+- **For trends**: Include specific value ranges (e.g., "stabilizes between negative 75 and negative 50")
+- Use precise technical terminology - be specific about medical/scientific terms (e.g., "CMR reports" not just "records")
+- Include complete technical phrases - don't truncate important terms (e.g., "wall motion score" not just "wall motion")
+- Verify all abbreviations and acronyms - ensure accuracy of medical/technical abbreviations
+- Use precise action words - choose specific verbs that accurately describe the context (e.g., "using" vs "and" for describing agents/tools)
+- For physical objects: Prioritize descriptive physical features (shape, size, form, texture, arrangement) over labeled components
+
+3. Content Guidelines:
+
+- Double-check all technical terms and abbreviations for accuracy
+- Avoid use of colors, never describe the color of a component in the image
+- Avoid vague or general terms like "Two illustrations depict…" unless no specific type can be identified
+- If the image is a photo of a person, just identify the person
+- Lead with purpose: What is this image trying to communicate?
+- Essential information only: What would someone miss if they couldn't see this?
+- Natural language: Write as you would speak to someone
+- Avoid visual jargon: Don't use terms like "depicted" or "shown"
+- Include key numbers/data: If it's a chart, what are the main values?
+- Preserve complete technical phrases - don't shorten important medical/scientific terms
+- Use contextually appropriate prepositions (using, with, showing, etc.)
+- **For line graphs with trends**: Specify increasing, decreasing, or bell shape trend
+- **For bar charts**: State highest and lowest bars with specific values where applicable
+- **For comparative graphs**: Use "shows a higher peak than" NOT "plots above"
+
+3.5. Complete Trend Coverage:
+- Describe trends across the ENTIRE data range (not just the endpoint)
+- Include all visible peaks, valleys, and turning points
+- For time-series: mention trend at each major time point
+- For comparisons: explicitly state which element is higher/lower
+- Never describe only "a peak at the end" - describe the full trajectory leading to that peak
+
+4. Technical Accuracy Priority:
+
+- Verify all medical/scientific abbreviations - ensure correct interpretation (e.g., LGE, CMR, etc.)
+- Use complete technical terminology - include important qualifiers like "score," "reports," "agent"
+- Choose precise prepositions - use "using," "with," "showing" appropriately based on context
+- Maintain technical specificity - don't generalize specialized terms
+- Use descriptive adjectives for physical attributes (tapering, flat, curved, cylindrical, etc.) when describing objects
+- Focus on spatial relationships: attached to, extending from, positioned at, surrounding
+- Describe structural elements: tip, end, middle, base, surface, edge
+- Choose descriptive verbs that convey physical characteristics
+- **Use complete scientific names**: "Ammonia beccarii" NOT just "Ammonia"
+- **Use "to" for ranges**: "7 to 1" NOT "7 minus 1"
+
+5. Examples of Preferred Approach:
+
+- For objects: "A diagram shows a syringe with a tapering tip, fluid-filled barrel, and flat plunger end"
+- For data/technical content: "Database query result showing 69,227 CMR reports with wall motion score above 2, positive LGE, using gadoteridol contrast agent"
+- Less preferred: "A diagram shows syringe parts labeled: tip, barrel, plunger, and flange"
+- Less preferred: "Database query result shows 69,227 records with wall motion above 2, positive age, and gadoteridol contrast agent"
+
+6. SME-Quality Examples to Emulate:
+
+Study these expert-written examples and match their style, precision, and clarity:
+
+Example 1 - Process/Flow Diagram:
+"A flowchart shows multiple causes of breathing abnormalities leading to hypoventilation or hyperventilation, resulting in respiratory and systemic complications."
+
+Key features:
+- Identifies image type (flowchart)
+- Describes the flow/process (causes → conditions → complications)
+- Uses precise medical terminology
+- Captures the complete cause-and-effect relationship
+
+Example 2 - Medical Imaging:
+"A chest X-ray shows a single round nodule in the lung field indicated by an arrow, consistent with adenocarcinoma of the lung."
+
+Key features:
+- Identifies image type (chest X-ray)
+- Describes anatomical location precisely (lung field)
+- Notes physical characteristics (single, round nodule)
+- Mentions diagnostic indicators (arrow)
+- Includes clinical interpretation (consistent with adenocarcinoma)
+
+Example 3 - Anatomical Pathology Diagram:
+"A heart diagram shows Tetralogy of Fallot with ventricular septal defect, overriding aorta, pulmonic stenosis, and right ventricular hypertrophy."
+
+Key features:
+- Identifies image type (heart diagram)
+- Names the specific condition (Tetralogy of Fallot)
+- Lists all four characteristic features systematically
+- Uses precise anatomical and pathological terminology
+- Comprehensive description of the congenital defect
+
+Example 4 - Detailed Anatomical Structure:
+"A labeled diagram of nephron structure shows cortical and juxtamedullary nephrons with associated arteries, veins, tubules, and vasa recta in the cortex and medulla."
+
+Key features:
+- Identifies image type and purpose (labeled diagram)
+- Specifies both nephron types (cortical and juxtamedullary)
+- Lists key anatomical components systematically
+- Includes associated structures (blood vessels, tubules)
+- Indicates anatomical regions (cortex and medulla)
+- Captures the comprehensive scope of the diagram
+
+When creating alt text, aim for this level of:
+- Clinical precision
+- Logical flow and relationships
+- Essential diagnostic information
+- Clear, professional medical language
+- Complete but concise descriptions
+- Systematic enumeration of key features
+- Anatomical specificity and regional context
+
+Key Accuracy Reminders:
+
+- Verify all abbreviations and technical terms
+- Use complete phrases (don't truncate important words)
+- Choose contextually appropriate prepositions
+- Maintain technical specificity
+- Follow the SME example patterns for similar image types
+- **Count elements precisely** (7 peaks, not "distinct peaks")
+- **Describe positions for waveforms** (each peak's location on horizontal axis)
+- **Use correct graph type** (waveform vs line graph)
+
+Format your response as:
+Alt Text: [Alt text begins. Clear, conversational description under 30 words focusing on physical characteristics. Alt text provided by Elsevier.]
+
+After generating both alt texts, provide these scores on separate lines:
+Confidence Score: [score from 1-10]
+Relevance Score: [score from 1-10]
+Correctness Score: [score from 1-10]
+Accuracy Score: [score from 1-10]
+
+Only return the two alt texts and the four scores — no extra commentary, titles, or formatting.
+
+### IF MODERATE:
+Generate TWO alt texts:
+- Detailed Alt Text – A thorough, narrative-style description under 700 characters
+- Short Alt Text – A concise and meaningful summary in fewer than 30 words AND under 200 characters
+
+**MANDATORY: Every alt text for MODERATE images — both short and long — must begin with "Alt text begins" and end with "Alt text provided by Elsevier". These phrases wrap the description content and apply to BOTH short_alt_text_formatted and long_alt_text_formatted fields.**
+
+Example structure:
+Short Alt Text: Alt text begins. [Your concise description here.] Alt text provided by Elsevier.
+Detailed Alt Text: Alt text begins. The [your detailed description here.] Alt text provided by Elsevier.
+
+Follow the comprehensive guidelines below to ensure consistency, clarity, and accessibility:
+
+Alt Text Writing Guidelines
+
+0. COLOR USAGE RULE:
+- Use exact color names when they appear as data labels or in legends (green line, red bar, yellow curve)
+- Avoid decorative color descriptions that add no informational value (pale pink, light blue background)
+- If legend shows "green, yellow, red, and black", use those exact terms
+- Use brightness, contrast, patterns, textures instead
+- Instead of color, try use shape of the line , texture of the line, pattern of the line, etc.
+
+1. Matched Opening Style (CRITICAL):
+- Ensure both alt texts begin consistently with the SAME content structure.
+
+- If the short alt text starts with: "A six-panel diagram shows…", then the long alt text MUST begin with: "The six-panel diagram shows…"
+- If the short alt text starts with: "A flowchart presents…", then the long alt text MUST begin with: "The flowchart presents…"
+- The opening phrase must be identical in content, differing only in article usage (A vs The)
+- This matching is MANDATORY for consistency
+- NOTE: The matched opening style applies to the description content AFTER "Alt text begins" and BEFORE "Alt text provided by Elsevier"
+
+2. Image Type Declaration and Content Specificity:
+- Start with a clear and specific image type such as:
+
+- "A diagram shows…"
+- "An illustration presents…"
+- "A chart outlines…"
+- "A waveform graph displays…" (for periodic signals with sharp peaks - NOT line graph)
+- "A line graph shows…" (for connected trend data)
+- "A paired bar graph shows…" (when bars are in pairs - use "paired" accurately)
+- "A scatter plot displays…"
+- "A forest plot compares…"
+- "A photo shows…" (for photographs of real objects/people)
+- "A stacked bar graph shows..." (NEW - for cumulative vertical bars)
+- "A block flow diagram shows..." (NEW - for rectangular process blocks)
+- Avoid vague introductions like "An image displays…" unless specificity is not possible.
+- NO color descriptions whatsoever
+- **For photos: Must start with "A photo shows..." to identify image type correctly**
+**Image Type Accuracy:** Never say "bar chart" - always "bar graph"
+For SHORT ALT TEXT specifically:
+
+- Be highly specific about the scientific/technical content rather than generic
+- Include key technical terms that capture the essence (e.g., "cell-matrix separation," "regression pathways")
+- Mention the specific number of panels/sections and their primary focus
+- Use precise medical/scientific terminology when available
+- Use precise action words - choose specific verbs that accurately describe the context (e.g., "using" vs "and" for describing agents/tools)
+- For physical objects: Prioritize descriptive physical features (shape, size, form, texture, arrangement) over labeled components
+- **Use complete scientific names**: "Ammonia beccarii" NOT just "Ammonia"
+- **SME Rule: Short descriptions cannot be too short - must provide adequate context within character limits**
+
+3. Tense and Grammar:
+
+- Always write in present tense
+- Avoid gerund forms (e.g., avoid "-ing" endings)
+- **ALL sentences MUST begin with capital letters**
+- Use "three panels" NOT "A three panel diagram"
+- **Replace ALL question marks with periods in descriptions**
+- Correct - "A chart outlines…"
+- Wrong - "A chart outlining…"
+
+4. Narrative-Driven Long Description with Enhanced Precision:
+
+- The long alt text must follow a step-by-step narrative, mirroring the visual structure and layout of the image (e.g., left to right, bottom to top, or panel by panel).
+- **Complete Trend Analysis:** Describe trends across the entire range, not just endpoints. Include all peaks, lows, turning points for every data series or panel.
+- **Explicit Comparisons:** For grouped data, state which is highest/lowest/intermediate with specific values or positions.
+- Do not summarize or interpret patterns. Describe only what is visually presented, including boxes, arrows, values, and legends.
+- Use highly specific spatial references such as "positioned at the far right," "along the lateral wall," "stacked rows," "vertical column," "adjacent squares," or "surrounding borders" to help the reader mentally visualize precise locations.
+- Describe ALL visual elements in their exact arrangement: calibration bars, scales, gradients, legends, captions, and their precise positioning
+- Be explicit about geometric arrangements: "two-by-two composite," "stacked rows each holding two adjacent squares," "vertical calibration bar"
+- Include all intermediate text elements: subtitles, captions, labels exactly as they appear and where they're positioned
+- Describe connecting elements with precision: direction of arrows, what they connect, labels on arrows
+- **For flowcharts/decision trees (SME CRITICAL):**
+  - Verify arrow directions carefully (e.g., check what dashed arrows actually point to)
+  - Describe branching accurately (e.g., "u0 branches to unlabeled leaf and u1")
+  - Decision boxes must be described as questions with yes/no branches
+  - State where F (false) redirects (e.g., "F redirects to step 1")
+  - State where T (true) points (e.g., "T points to step 6")
+- Mention all measurement details: ranges, units, percentages, and their spatial context
+- Narrate as if providing a detailed guided tour through the image, not just stating observations.
+- Use varied sentence structures to describe content naturally. Avoid repeatedly starting sentences with "Panel shows..." or "Image displays..."
+- Integrate formula relationships into the description by explaining what they calculate and their positioning in the image.
+- Describe visual scales and gradients in detail: "continuous hue gradient fills the bar," "graduated scale"
+- **SME CRITICAL: "LD must include ALL visual elements; missing details denies access"**
+- **Cannot omit**: Structural features, trend details, chemical structures, statistical relationships, small visual elements
+- Example: Right - "The diagram begins with..." | Wrong - "The diagram provides an overview of..."
+
+5. Enhanced Flow and Structural Clarity:
+
+Write the long alt text as a coherent narrative with clear section transitions.
+Explicitly state how sections connect (e.g., "connected by horizontal arrows," "preceded by a short right-pointing arrow").
+Clearly indicate spatial relationships, transitions, and groupings across panels or sections.
+Vary sentence structure to avoid repetitive rhythm and enhance readability.
+Use transitional phrases to guide the reader through the visual journey.
+
+6. Layout Order with Precision:
+
+Describe elements in the natural or logical reading order of the image.
+For layered diagrams (e.g., pyramid or funnel shapes), describe from bottom to top unless otherwise directed.
+Be explicit about arrangement patterns (e.g., "arranged vertically," "stacked rows," "side by side").
+**Omit unnecessary position references (top left, top right) unless needed for clarity**
+
+7. Comprehensive Label and Content Coverage:
+
+Refer to all visible labels, values, annotations, captions, and subtitles in their exact order and positioning.
+Include all numerical values, percentages, and units as they appear.
+Do not omit minor or technical elements that are visually present.
+Describe legends and their positioning relative to the main content.
+**For Panel A–D type figures: include ALL labels, dense clusters, peripheral elements, keywords from densest regions**
+**Do NOT miss small but critical elements** (e.g., "dark circular hemorrhagic transformation within bright region")
+**Technical Diagram Completeness:**
+- Communication diagrams: start bits, data frame bits (5-9 bits), parity bits, stop bits
+- Experimental designs: all control variables (age, gender, experience, duration)
+- Performance metrics: all score types (ON scores, OFF scores, baseline, etc.)
+- Network diagrams: all node relationships including child, parent, sibling connections
+
+8. Abbreviations and Units:
+
+Spell out all scientific units, mathematical symbols, acronyms, and Roman numerals.
+For non-pronounceable abbreviations ,insert spaces between letters or meaningful parts (e.g., "A I", "N A S A", or "R N A")(IMPORTANT).
+for graph images do not use X-axis and Y-axis, instead use horizontal axis and vertical axis.(IMPORTANT)
+**Use "to" for ranges**: "7 to 1" NOT "7 minus 1" or "2 to 1" NOT "2 minus 1"
+**Replace minus with dash in identifiers**: "I E 5" and "I E 4" NOT "I E minus 5"
+**Remove special symbols**: "marajo" NOT "marajó"
+
+9. Enhanced Visual Detail Description:
+
+Describe visual scales, gradients, and calibration elements with specific positioning and range details.
+Mention brightness, shading, and visual contrast where relevant to understanding.
+Be specific about geometric shapes and their relationships (e.g., "solid squares," "empty squares," "irregular bright region").
+**Describe translucency or appearance WITHOUT mentioning color**
+**Do NOT mention markers that don't exist** (e.g., don't mention square markers if only circular markers are present)
+**For bar graphs: mention ALL bar pairs individually - never skip any**
+**For grouped elements: explain grouping clearly** (e.g., "Panel B shows grouped bell-shaped lines across 3 categories")
+
+10. Purpose Statement:
+
+If the function or intent of the image is clear, end the long alt text with a single sentence summarizing its role or message — placed BEFORE the mandatory closing phrase "Alt Text Provided by Elsevier".
+Example: "The diagram illustrates how extracellular volume reflects myocardial remodeling. Alt Text Provided by Elsevier."
+**NEVER end with conclusions like "These panels illustrate..." - just describe what's visible**
+
+11. Strict Exclusions:
+
+Do not include figure numbers, citations, footnotes, or source attributions present in the image.
+NEVER describe or reference color under any circumstance - this is absolutely prohibited.
+Do not describe image captions - if there is text that appears as a caption to the entire image, do not include it in the description.
+Focus only on the diagram/chart/illustration content itself, not accompanying caption text.
+- **Avoid Redundant Positioning:** Do not add "Panel C is bottom left" unless essential for navigation between non-sequential panels
+- **No Concluding Statements:** Never end with "Together, these panels illustrate..." or "This demonstrates..." - just describe what is visible
+- **No Irrelevant Details:** Avoid explaining arrows or elements that don't contribute to understanding the core content
+
+12. SME-Quality Examples to Emulate:
+
+Study these expert-written moderate-length descriptions and match their style, precision, and systematic organization:
+
+### 13. **Single-Paragraph Format for Long Descriptions:**
+
+**MANDATORY formatting rules:**
+- Write the entire LD as ONE continuous paragraph - no paragraph breaks
+- Use correct hyphenation consistently:
+  * multi-panel (NOT multi panel)
+  * cross-section (NOT cross section)
+  * well-established (NOT well established)
+  * two-by-two (NOT two by two)
+- Maintain consistent formatting throughout
+- Use transitional phrases to connect ideas smoothly within the single paragraph
+
+**Wrong:**
+"Panel A shows X.
+
+Panel B shows Y.
+
+Panel C shows Z."
+
+**Correct:**
+"Panel A shows X, while Panel B shows Y, and Panel C shows Z, together illustrating the progression from initial state through intermediate stages to final outcome."
+
+#### **Example 1 - Anatomical System Overview:**
+"The diagram shows the urinary system with surrounding organs and vessels from top to bottom. The adrenal glands sit above both kidneys, with the liver and spleen nearby. The right and left kidneys are connected to the renal arteries and veins, branching from the abdominal aorta and inferior vena cava. Each kidney extends downward into a ureter that carries urine to the urinary bladder located centrally in the pelvis. The urethra extends from the bladder to the body's exterior. The common iliac arteries and veins are also labeled near the lower abdomen."
+
+**Key Features:**
+- **Systematic Spatial Organization**: Describes anatomical structures from top to bottom in logical sequence
+- **Anatomical Relationships**: Clearly states how structures connect ("connected to," "branching from," "extends downward into")
+- **Bilateral Structures**: Explicitly mentions paired organs (right and left kidneys, both adrenal glands)
+- **Directional Flow**: Traces the path of urine through the system
+- **Surrounding Context**: Includes nearby organs for anatomical context (liver, spleen)
+- **Vascular Connections**: Names specific blood vessels and their relationships
+- **Precise Location Terms**: Uses anatomical positioning (above, nearby, centrally in the pelvis, near the lower abdomen)
+- **Functional Description**: Notes the function of structures (carries urine, extends to body's exterior)
+
+#### **Example 2 - Multi-Panel Comparative Physiology:**
+"The three-part diagram explains normal, low, and high ventilation-perfusion conditions. In the first panel, labeled normal V Q, airflow passes through the airway into the alveolus, and blood flows from the pulmonary artery through the alveolocapillary membrane to the pulmonary vein, indicating balanced ventilation and perfusion. In the second panel, labeled low V Q or shunt, impaired ventilation reduces air entry into the alveolus, causing hypoxemia. In the third panel, labeled high V Q or dead space, airflow is normal, but blood perfusion is impaired, leaving alveolar dead space and resulting in hypoxemia."
+
+**Key Features:**
+- **Panel Enumeration**: Clearly identifies number of panels and overall topic
+- **Sequential Panel Description**: Systematically describes each panel in order
+- **Panel Labeling**: Includes exact panel labels as they appear (normal V Q, low V Q or shunt, high V Q or dead space)
+- **Pathway Tracing**: Follows flow paths (airflow through airway, blood flow from artery to vein)
+- **Anatomical Specificity**: Names precise structures (alveolus, alveolocapillary membrane, pulmonary artery/vein)
+- **Comparative Structure**: Shows how each condition differs from normal
+- **Physiological States**: Describes the functional status in each panel (balanced, impaired ventilation, impaired perfusion)
+- **Clinical Outcomes**: States the physiological consequence of each condition (hypoxemia, alveolar dead space)
+- **Condition Naming**: Uses both technical terms and alternative names (shunt, dead space)
+
+#### **Common Patterns Across Moderate-Length SME Examples:**
+
+**Spatial Navigation Approach:**
+- Establish clear directional framework (top to bottom, left to right, panel by panel)
+- Use consistent spatial reference terms throughout
+- Connect adjacent or related structures explicitly
+- Maintain logical flow that mirrors visual organization
+
+**Anatomical Precision:**
+- Name all anatomical structures with correct terminology
+- Specify bilateral vs. single structures
+- Note spatial relationships between organs/structures
+- Include surrounding anatomical context when relevant
+- Use precise directional terms (above, below, centrally, near)
+
+**Multi-Panel Organization:**
+- State total number of panels/sections upfront
+- Identify each panel by its label or position
+- Describe panels in consistent reading order
+- Compare/contrast conditions across panels
+- Include panel-specific labels exactly as shown
+
+**Functional Context:**
+- Describe flow or pathway direction (airflow, blood flow, urine flow)
+- Note connections between structures (connected to, branching from, extends into)
+- Include functional purpose where relevant (carries, flows through, extends to)
+- State physiological outcomes or clinical consequences
+- Distinguish between normal and abnormal states
+
+**Technical Accuracy:**
+- Use precise medical/anatomical terminology
+- Spell out abbreviations with context (V Q for ventilation-perfusion)
+- Include alternative terminology when provided (shunt, dead space)
+- Maintain technical specificity without over-explaining
+- Balance detail with conciseness (staying under 700 characters)
+
+**Structural Elements:**
+- Opening sentence establishes overall content and organization
+- Middle sentences systematically cover all components
+- Closing may note functional purpose or clinical significance
+- Transitions connect related elements smoothly
+- Varied sentence structure maintains readability
+
+When creating moderate-length alt text, aim for this level of:
+- **Systematic spatial organization**
+- **Anatomical and physiological precision**
+- **Clear comparative structure for multi-panel images**
+- **Functional pathway description**
+- **Clinical relevance and outcomes**
+- **Concise but complete coverage**
+- **Smooth narrative flow within character limits**
+
+Key Improvements for SME-Level Output:
+
+For SHORT ALT TEXT: Use specific scientific terminology (e.g., "cell-matrix separation" not "compartments"), mention exact number of elements, include key technical processes
+Use more precise spatial language (e.g., "positioned at the far right" instead of "on the right")
+Include ALL captions and subtitles exactly as they appear and their positioning (e.g., "A caption underneath reads...")
+Describe visual elements in greater detail (e.g., "continuous hue gradient fills the bar" instead of "gradient scale")
+Be more specific about arrangements (e.g., "two stacked rows, each holding two adjacent squares" instead of "arranged in rows")
+Include all intermediate captions and subtitles exactly as they appear with their positioning
+Describe connecting elements precisely (e.g., "connected by horizontal arrows pointing from an arrow labeled...")
+Mention all measurement units and formulas with their exact positioning and context
+Include descriptive details about visual scales: mention if they're graduated, continuous, have hue gradients, etc.
+Describe the exact arrangement of elements: if squares are "narrowed," "reduced," "proportionally smaller," etc.
+Include ALL text elements: questions, statements, legends, and their positioning relative to diagrams
+
+Additional Critical Instructions:
+For achieving SME-level precision:
+
+MANDATORY: Ensure matched opening style - Short and long alt texts must start with identical content structure (A vs The), both wrapped with the mandatory prefix and suffix
+Always include opening text/titles exactly as they appear at the top of diagrams (but NOT image captions)
+Describe ALL captions and subtitles WITHIN the diagram with their exact positioning (e.g., "A caption underneath reads..." or "subtitled...")
+Include ALL connecting text on arrows, between sections, and transitional elements
+Describe visual modifications precisely: "narrowed," "reduced," "proportionally smaller," "brighter," "irregular"
+Mention ALL numerical values with their units and context
+Include closing questions or statements exactly as they appear
+Use specific geometric descriptions: "oval ring," "circular blood pool," "two-by-two composite"
+Describe scale elements completely: mention if they're vertical, their range, gradient type, positioning
+NEVER mention colors - describe brightness, contrast, patterns, or textures instead
+Skip image captions - only describe content within the actual diagram/illustration
+
+Template for Panel Structure:
+"Panel [X] [verb] [title/subtitle]. [Detailed spatial description starting with overall layout, then specific elements, then any captions/text below]."
+IMPORTANT REMINDERS:
+
+Short alt text: "Alt text begins. A [type] [action]... Alt text provided by Elsevier."
+Long alt text: "Alt text begins. The [type] [action]... Alt text provided by Elsevier."
+NO color descriptions whatsoever
+NO image captions (only describe diagram content)
+Include ALL internal text elements (titles, subtitles, labels, questions within the diagram)
+
+Only return the two alt texts and the four scores — no extra commentary, titles, or formatting.
+
+Please provide your response in the following format:
+Short Alt Text: [Alt text begins. Your concise description under 30 words AND under 200 characters. Alt text provided by Elsevier.]
+Detailed Alt Text: [Alt text begins. The your detailed description under 700 characters. Alt text provided by Elsevier.]
+
+After generating both alt texts, provide these scores on separate lines:
+Confidence Score: [score from 1-10]
+Relevance Score: [score from 1-10]
+Correctness Score: [score from 1-10]
+Accuracy Score: [score from 1-10]
+
+Only return the two alt texts and the four scores — no extra commentary, titles, or formatting.
+
+### IF COMPLEX:
+Generate TWO alt texts:
+- Detailed Alt Text – A thorough, narrative-style description exceeding 700 characters
+- Short Alt Text – A concise and meaningful summary in fewer than 30 words AND under 200 characters
+
+**MANDATORY: Every alt text for COMPLEX images — both short and long — must begin with "Alt text begins" and end with "Alt text provided by Elsevier". These phrases wrap the description content and apply to BOTH short_alt_text_formatted and long_alt_text_formatted fields.**
+
+Example structure:
+Short Alt Text: Alt text begins. [Your concise description here.] Alt text provided by Elsevier.
+Detailed Alt Text: Alt text begins. The [your detailed description here.] Alt text provided by Elsevier.
+
+Follow the comprehensive guidelines below to ensure consistency, clarity, and accessibility:
+
+## Alt Text Writing Guidelines
+
+### 0. Color Usage Rule for Complex Images:
+- **Use exact color names when they appear as labels, legends, or data markers** (e.g., "green line for control, red line for treatment")
+- **Printed color labels must be reproduced accurately** - if legend says "green"/"red"/"yellow"/"black", use those exact words
+- **Avoid decorative color descriptions** - do not describe color of backgrounds, borders, or styling unless it carries information
+- **For functional elements**: Describe by shape, line style, or pattern when color is not labeled (e.g., "solid line," "dashed line," "dotted line")
+- This rule is consistent with global principle: color names ARE data when they're categorical markers or labeled in the image
+
+### 1. Critical Multi-Part Image Analysis Requirements:
+
+#### **Panel/Section Counting and Arrangement:**
+- **COUNT METICULOUSLY**: Always count ALL panels, sections, or components multiple times before writing
+- **VERIFY EXACT ARRANGEMENT**: Determine the precise grid layout (e.g., 2x2, 3x1, 2x3, 4x2, etc.)
+- **ESTABLISH ORIENTATION**: Clearly identify if panels are arranged horizontally, vertically, or in a matrix
+- Common counting errors to avoid:
+  - Miscounting total panels (e.g., saying "6 panels" when there are 7 or 8)
+  - Missing corner panels or edge sections
+  - Overlooking small inset panels or sub-diagrams within larger panels
+
+**Arrow and Connector Verification Process:**
+1. **Identify all arrow types** present in the image before describing
+2. **Catalog arrow functions**: inhibition, activation, feedback, progression, bidirectional
+3. **Map connections**: What does each arrow connect and in which direction?
+4. **Verify loops**: Are there feedback arrows returning to earlier steps?
+5. **Check special symbols**: Perpendicular ends, blunt ends, dashed vs solid
+
+**Common Errors to Avoid:**
+- Calling all arrows simply "arrows" without distinguishing types
+- Missing feedback loops that return to Step 1 or earlier stages
+- Describing inhibitory arrows (perpendicular end) as normal directional arrows
+- Not distinguishing bidirectional arrows from unidirectional ones
+
+#### **Precise Spatial Positioning System:**
+For multi-part images, use this hierarchical positioning system:
+
+**Matrix Arrangements (2x2, 3x3, etc.):**
+- Top row: "top-left," "top-center," "top-right"
+- Middle row: "middle-left," "center," "middle-right"
+- Bottom row: "bottom-left," "bottom-center," "bottom-right"
+
+**Linear Arrangements:**
+- Horizontal: "leftmost," "second from left," "center-left," "center-right," "second from right," "rightmost"
+- Vertical: "topmost," "second from top," "middle-upper," "middle-lower," "second from bottom," "bottommost"
+
+**Complex Arrangements:**
+- Use row and column references: "Panel in row 2, column 3"
+- For irregular layouts: "Panel positioned in the upper-left quadrant," "Panel occupying the lower-right corner"
+- For overlapping or inset elements: "Small inset panel within the main panel," "Overlay positioned in the top-right corner of Panel A"
+- **Omit unnecessary position references (top left, top right) unless needed for clarity**
+
+#### **Enhanced Panel Description Structure:**
+For each panel in multi-part images, provide:
+1. **Exact Position**: Where it sits in the overall arrangement
+2. **Panel Identification**: Title, label, or distinguishing features
+3. **Internal Layout**: How elements are arranged within that specific panel
+4. **Content Description**: All visible elements, text, diagrams within the panel
+5. **Inter-panel Connections**: Arrows, lines, or references connecting to other panels
+6. **Panel-specific Captions**: Any text appearing below or within that panel
+
+### 2. Data and Measurement Precision:
+**ZERO TOLERANCE FOR DATA HALLUCINATION:**
+- All numerical values must come directly from the image - no approximations
+- Never invent temperatures, keV readings, percentages, or measurements
+- If a value is unclear or not visible, do not guess - omit it or state it's not clearly visible
+- Count structural elements multiple times to verify accuracy
+- Distinguish between "3 separate graphs" vs "1 graph with 2 insets"
+
+- **READ ALL TEXT EXACTLY**: Include all visible text, labels, and values as they appear in each panel
+- Spell out numbers and measurements precisely, noting which panel they appear in
+- Include statistical indicators (asterisks, significance markers) with their exact positioning within specific panels
+- Describe trends accurately within each panel and across panels when relevant
+- **For statistical data (SME CRITICAL)**: Must link O R, 95 percent confidence interval, AND p value
+- **For trends (SME CRITICAL)**: Specify exact value ranges (e.g., "stabilizes between negative 75 and negative 50")
+- **Use comparative language**: "shows a higher peak than" (NOT "plots above")
+
+### 3. Enhanced Matched Opening Style for Multi-Part Images:
+Ensure both alt texts begin consistently with the SAME content structure, specifying the exact arrangement:
+
+**Examples:**
+- Short: "Alt text begins. A four-panel diagram arranged in a two-by-two grid shows... Alt text provided by Elsevier."
+- Long: "Alt text begins. The four-panel diagram arranged in a two-by-two grid shows... Alt text provided by Elsevier."
+
+- Short: "Alt text begins. A six-panel flowchart arranged horizontally presents... Alt text provided by Elsevier."
+- Long: "Alt text begins. The six-panel flowchart arranged horizontally presents... Alt text provided by Elsevier."
+
+The opening must specify:
+- Total number of panels/sections
+- Arrangement pattern (grid, horizontal, vertical, irregular)
+- Primary content type
+ **Use "three panels" NOT "A three panel diagram"**
+- NOTE: The matched opening style applies to the description content AFTER "Alt text begins" and BEFORE "Alt text provided by Elsevier"
+
+### 4. Multi-Part Image Type Declaration:
+Start with specific image type and arrangement:
+- "A [number]-panel diagram arranged in a [arrangement] shows..."
+- "An [number]-section illustration organized as [pattern] presents..."
+- "A [number]-part chart configured in [layout] outlines..."
+
+**Arrangement Patterns:**
+- "two-by-two grid"
+- "horizontal sequence"
+- "vertical stack"
+- "three-by-two matrix"
+- "L-shaped configuration"
+- "circular arrangement"
+- "irregular cluster"
+
+### 5. Comprehensive Multi-Part Navigation Strategy:
+
+#### **Systematic Panel Traversal:**
+- **Establish Reading Order**: Clearly state the order you'll describe panels (e.g., "moving left to right across the top row, then left to right across the bottom row")
+- **Consistent Navigation Language**: Use transitional phrases like:
+  - "Moving to the adjacent panel..."
+  - "The panel directly below shows..."
+  - "In the corresponding right panel..."
+  - "The final panel in the sequence..."
+  - "Returning to the top row..."
+
+#### **Inter-Panel Relationship Mapping:**
+- **Connection Description**: Describe arrows, lines, or visual elements connecting panels
+- **Sequential Relationships**: Explain how panels build upon each other
+- **Comparative Elements**: Note similarities or differences between panels
+- **Cross-References**: Mention when elements in one panel reference or relate to elements in another
+
+### 6. Enhanced Spatial Reference System:
+
+#### **Within-Panel Positioning:**
+For elements within individual panels, use:
+- "In the upper portion of this panel..."
+- "Along the left edge of Panel A..."
+- "Centered within the middle panel..."
+- "At the base of the rightmost section..."
+
+#### **Cross-Panel Positioning:**
+- "Aligned vertically with the element in the panel above..."
+- "Positioned to mirror the layout in the adjacent panel..."
+- "Offset from the corresponding element in Panel B..."
+
+**Complete Trend Description Across All Panels:**
+- Describe trends for EVERY panel, including Panel D, E, F in multi-panel figures
+- Never stop at Panel C or mention "similar patterns in remaining panels"
+- For each panel: state the full trend from start to end, not just the final value
+- Include comparative analysis: which panel/group shows highest/lowest values at which points
+
+### 7. Detailed Panel-by-Panel Narrative Structure:
+
+#### **Opening Overview:**
+Start with the overall arrangement and total structure before diving into individual panels.
+
+#### **Individual Panel Deep-Dive:**
+For each panel, provide:
+1. **Position Statement**: "Panel [X], located [position description]..."
+2. **Panel Title/Label**: Include any titles or labels specific to that panel
+3. **Internal Organization**: Describe the layout within that panel
+4. **Content Enumeration**: List all elements, maintaining spatial relationships
+5. **Panel-Specific Text**: Include all captions, labels, values within that panel
+6. **Connection Notes**: Mention any arrows or lines leading to/from other panels
+7. **ALL visual elements**: Missing any detail denies access (SME CRITICAL)
+8. **For Panel B specifically**: Note if it contains "2 vertically arranged images" and describe both
+
+#### **Integration Summary:**
+After describing all panels individually, briefly explain how they work together as a complete system — placed BEFORE the mandatory closing phrase "Alt Text Provided by Elsevier".
+**NEVER end with conclusions like "These panels illustrate..."** - just describe what's visible
+
+### 8. Multi-Part Layout Order Precision:
+
+#### **Standard Reading Patterns:**
+- **Western Reading**: Left-to-right, top-to-bottom (default)
+- **Scientific/Technical**: May follow process flow or logical sequence
+- **Comparative**: May group related panels together
+
+#### **Layout Exceptions:**
+- **Circular Arrangements**: Start at a clear reference point (e.g., "beginning at the top position and moving clockwise...")
+- **Center-Out Patterns**: Start with central element and move outward
+- **Process Flows**: Follow the logical sequence regardless of spatial arrangement
+
+### 9. Comprehensive Multi-Panel Text Integration:
+
+#### **Hierarchical Text Description:**
+- **Overall Titles**: Text applying to the entire multi-part image
+- **Section Headers**: Text applying to groups of panels
+- **Panel Titles**: Text specific to individual panels
+- **Element Labels**: Text labeling specific items within panels
+- **Captions**: Explanatory text below or within panels
+
+#### **Text Positioning Accuracy:**
+- "The overall title at the top reads..."
+- "Panel A is subtitled..."
+- "A caption beneath this panel states..."
+- "Text along the bottom of the entire figure reads..."
+
+### 10. Enhanced Visual Detail for Multi-Part Images:
+
+#### **Panel Boundaries and Separation:**
+- Describe how panels are visually separated (lines, spacing, borders)
+- Note if panels have consistent sizing or varying dimensions
+- Mention any visual hierarchy between panels
+
+#### **Consistent Visual Elements:**
+- Note recurring visual elements across panels
+- Describe variations in similar elements between panels
+- Explain any visual coding system used across panels
+- **Do NOT mention markers that don't exist** (e.g., square markers when only circular exist)
+- **For bar graphs: mention ALL bar pairs individually** - never skip any
+- **For grouped elements**: Explain grouping clearly (e.g., "Panel B shows grouped bell-shaped lines across 3 categories")
+
+#### **Translucency and Appearance:**
+- Describe translucency or appearance WITHOUT mentioning color
+- Use brightness, contrast, patterns, textures instead
+
+**Physical Properties and Material Descriptions:**
+- Describe translucency, opacity, and brightness without color terms
+- Physical forms: cylindrical, conical, spherical, flat, ridged, smooth
+- Material indicators: metallic appearance, translucent material, opaque structure
+- Attachments and connections: wires, rods, tubes, flanges, tips
+- Scale indicators: measurements shown on rulers, callipers, or scale bars
+- Textural details: smooth surface, textured area, patterned region
+
+### 11. Multi-Part Abbreviations and Technical Terms:
+
+#### **Consistent Terminology:**
+- Establish abbreviations once and use consistently across all panels
+- Spell out technical terms fully when first introduced
+- Maintain consistent spatial reference language throughout
+- **Use complete scientific names**: "Ammonia beccarii" NOT just "Ammonia"
+- **Use "to" for ranges**: "7 to 1" NOT "7 minus 1"
+- **Replace minus with dash in identifiers**: "I E 5" NOT "I E minus 5"
+- **Remove special symbols**: "marajo" NOT "marajó"
+
+#### **Panel-Specific Variations:**
+- Note when terminology changes between panels
+- Explain different measurement units used in different panels
+- Clarify any abbreviation variations across sections
+
+### 12. Enhanced Purpose Statement for Multi-Part Images:
+End with a comprehensive statement explaining how all panels 
+work together — placed BEFORE the mandatory closing phrase 
+"Alt Text Provided by Elsevier":
+- How all panels work together to convey the overall message
+- The relationship between different sections
+- The complete story told by the multi-part arrangement
+
+Example: "Together, these four panels demonstrate the progression 
+from initial cellular state through intermediate modifications 
+to final therapeutic outcome, illustrating the complete 
+treatment pathway. Alt Text Provided by Elsevier."
+
+**Example:** "Together, these four panels demonstrate the progression from initial cellular state through intermediate modifications to final therapeutic outcome, illustrating the complete treatment pathway. Alt Text Provided by Elsevier."
+
+### 13. Critical Multi-Part Exclusions:
+- Do not describe overall figure captions that apply to the entire multi-part image
+- Do not repeat identical elements across panels unless their positioning differs significantly
+- NEVER describe or reference color under any circumstance
+- Focus on diagram content within each panel, not external caption text
+- **No Redundant Positioning:** Avoid stating "top-left panel" repeatedly unless critical for distinguishing non-sequential panels
+- **No Concluding Interpretations:** Never end with "These panels demonstrate..." or "Together, this illustrates..." - only describe visible content
+- **No Caption Repetition:** If caption states "10 millimeters scale bar," do not repeat this in the description
+
+### 14. SME-Quality Examples to Emulate:
+
+Study these expert-written detailed descriptions and match their style, precision, and narrative flow:
+
+### 15. **Mandatory Single-Paragraph Format:**
+
+**All complex long descriptions must be written as ONE continuous paragraph:**
+
+- No paragraph breaks between panel descriptions
+- Use transitional phrases to connect panels smoothly
+- Maintain consistent hyphenation: multi-panel, cross-section, well-defined, two-by-two
+- Flow naturally from one panel to the next using connective language
+
+**Transitional Phrases to Use:**
+- "Moving to the adjacent panel..."
+- "The next panel in sequence..."
+- "Continuing to the right..."
+- "In contrast, the panel below..."
+- "Completing the series, the final panel..."
+
+**Format:**
+One unbroken paragraph describing all panels, their contents, relationships, and connections in a logical reading order with smooth transitions between sections.
+
+#### **Example 1 - Physiological Feedback Loop:**
+"The diagram shows the feedback loop that maintains blood pressure and fluid balance. It starts with water loss from the body, such as sweating, leading to decreased plasma volume and blood pressure. The hypothalamus detects this change and sends correction signals through nerve fibers to the posterior pituitary gland, which releases antidiuretic hormone. This hormone acts on the nephron, increasing water reabsorption to restore osmotic balance. Simultaneously, the juxtaglomerular apparatus in the kidney senses the drop in pressure and releases renin into the bloodstream. Renin converts angiotensin one into angiotensin two in the lungs. Angiotensin two stimulates the adrenal gland to secrete aldosterone, which increases sodium reabsorption and potassium secretion in the nephron. These changes raise plasma volume and blood pressure, completing the feedback loop to stabilize body fluids and circulation."
+
+**Key Features:**
+- **Sequential Process Flow**: Traces the complete pathway from initial stimulus to final outcome
+- **Anatomical Precision**: Names specific organs and structures (hypothalamus, posterior pituitary, juxtaglomerular apparatus)
+- **Physiological Mechanisms**: Describes hormone actions and their specific effects
+- **Dual Pathways**: Explains parallel regulatory mechanisms (ADH and renin-angiotensin-aldosterone)
+- **Cause-and-Effect Language**: Uses connective phrases ("leading to," "acts on," "resulting in")
+- **Complete Loop**: Returns to starting point showing homeostatic regulation
+- **Numerical Specificity**: References specific substances (angiotensin one, angiotensin two)
+
+#### **Example 2 - Quantitative Physiological Relationships:**
+"The diagram shows pressure relationships in the glomerulus across three regions: afferent arteriole, Bowman space, and efferent arteriole. The glomerular capillary hydrostatic pressure is 47 millimeters of mercury in the afferent arteriole and 45 millimeters of mercury in the efferent arteriole, favoring filtration. The glomerular capillary oncotic pressure is 25 millimeters of mercury at the afferent end and 35 millimeters of mercury at the efferent end, opposing filtration. The Bowman space hydrostatic pressure is 10 millimeters of mercury. Pressures opposing filtration total 35 plus 10, equaling 45 millimeters of mercury. The net filtration pressure, calculated as 47 minus 35 minus 10, equals 2 millimeters of mercury, resulting in a small net fluid movement from the glomerular capillaries into the Bowman space."
+
+**Key Features:**
+- **Spatial Organization**: Systematically describes three anatomical regions
+- **Quantitative Precision**: States exact pressure values with units (millimeters of mercury)
+- **Pressure Types**: Distinguishes between hydrostatic and oncotic pressures
+- **Regional Variation**: Notes how pressures change across different locations
+- **Functional Context**: Explains which pressures favor or oppose filtration
+- **Mathematical Calculation**: Shows the arithmetic for net filtration pressure
+- **Physiological Outcome**: Describes the resulting fluid movement and its magnitude
+- **Complete Numerical Reading**: Spells out all calculations and values
+
+#### **Common Patterns Across SME Examples:**
+
+**Narrative Structure:**
+- Begin with overall system or process identification
+- Follow logical sequence (temporal, spatial, or causal)
+- Connect each step explicitly to the next
+- Conclude with final outcome or homeostatic result
+
+**Technical Precision:**
+- Use accurate anatomical and physiological terminology
+- Include all quantitative data with proper units
+- Specify exact locations and spatial relationships
+- Distinguish between different types of the same category (e.g., pressure types)
+
+**Process Description:**
+- Start with trigger or initial condition
+- Trace signal/substance pathways step-by-step
+- Name intermediary structures and substances
+- Explain mechanism at each step
+- Show parallel or branching pathways when present
+- Complete the cycle or show final effect
+
+**Quantitative Approach:**
+- State all numerical values precisely
+- Include units of measurement
+- Show mathematical relationships when relevant
+- Note directional changes (increases/decreases)
+- Compare values across regions or conditions
+
+When creating detailed alt text, aim for this level of:
+- **Process clarity and continuity**
+- **Quantitative completeness**
+- **Anatomical and physiological precision**
+- **Logical narrative flow**
+- **Explicit cause-and-effect relationships**
+- **Complete system integration**
+- **Mathematical accuracy when calculations are shown**
+
+## Multi-Part Image Specific Instructions:
+
+### **Panel Counting Verification Process:**
+1. **Initial Count**: Count all distinct panels/sections
+2. **Arrangement Analysis**: Determine row and column structure
+3. **Double-Check**: Recount to verify accuracy
+4. **Edge Case Check**: Look for small inset panels, overlays, or partial panels
+
+### **Spatial Accuracy Checklist:**
+- ✓ Total panel count is accurate
+- ✓ Arrangement pattern is correctly described (e.g., 2x3 grid)
+- ✓ Each panel's position is precisely identified
+- ✓ Reading order is clearly established
+- ✓ Inter-panel connections are described
+- ✓ Within-panel spatial relationships are accurate
+
+### **Multi-Part Template Structure:**
+
+**Short Alt Text Template:**
+"Alt text begins. A [number]-panel [image type] arranged in a [pattern] shows [primary content focus including key technical terms and main elements across panels]. Alt text provided by Elsevier."
+
+**Detailed Alt Text Template:**
+"Alt text begins. The [number]-panel [image type] arranged in a [pattern] [primary content statement]. [Reading order establishment]. [Panel-by-panel systematic description with exact positioning, internal layout, content, and connections]. [Integration summary explaining how panels work together]. Alt text provided by Elsevier."
+
+### **Quality Assurance for Multi-Part Descriptions:**
+Before finalizing, verify:
+1. **Spatial Accuracy**: Can a reader mentally reconstruct the panel arrangement?
+2. **Completeness**: Are all panels described with sufficient detail?
+3. **Navigation Clarity**: Is the reading path through panels clear?
+4. **Relationship Mapping**: Are inter-panel connections explained?
+5. **Technical Precision**: Are panel-specific technical details accurate?
+6. **Mandatory Phrases**: Does every alt text begin with "Alt text begins" and end with "Alt text provided by Elsevier"?
+
+Only return the two alt texts and the four scores — no extra commentary, titles, or formatting.
+
+Please provide your response in the following format:
+Short Alt Text: [Alt text begins. Your concise description under 30 words AND under 200 characters. Alt text provided by Elsevier.]
+Detailed Alt Text: [Alt text begins. The your detailed description over 700 characters. Alt text provided by Elsevier.]
+
+After generating both alt texts, provide these scores on separate lines:
+Confidence Score: [score from 1-10]
+Relevance Score: [score from 1-10]
+Correctness Score: [score from 1-10]
+Accuracy Score: [score from 1-10]
+
+Only return the two alt texts and the four scores — no extra commentary, titles, or formatting.
+
+---
+
+## QA / VALIDATION GATE (run before moving to TASK 3)
+
+Before returning output, perform these checks; if any fail, rewrite once with stricter constraints:
+1. Panel count verified twice and matches description.
+2. All panels described individually.
+3. No identity or diagnosis present in assessment mode.
+4. No numeric values invented (every number included must be visible).
+5. All statistical triplets linked when present (O R, 95 percent CI, p).
+6. Screen-reader formatting applied to final strings.
+7. Short and long openings match the required "A / The" matched style when mandated.
+8. **MANDATORY CHECK**: Every short and long alt text begins with "Alt text begins" and ends with "Alt text provided by Elsevier". If either phrase is missing from any field, rewrite before returning output.
+
+## TASK 3: FORMAT ALT TEXT FOR SCREEN READERS
+
+After generating the alt text in Task 2, apply these formatting rules to make it accessible for screen readers:
+
+**CRITICAL FORMATTING RULES:**
+
+1. **Abbreviations**: Space out all letters in abbreviations for proper pronunciation. For example, 'DNA' becomes 'D N A', 'USA' becomes 'U S A', 'HIV' becomes 'H I V', 'WHO' becomes 'W H O'.
+2. **Complex Abbreviations**: Space out all letters and numbers in complex abbreviations. For example, 'BBNE4Y10W2' becomes 'B B N E 4 Y 10 W 2', 'Co-P[5]ImPhen' becomes 'C o P 5 I m P h e n'.
+3. **Chemical Formulas and Ions**: Space out chemical symbols and indicate charges with 'plus' or 'minus'. For example, 'Ho3+' becomes 'H o 3 plus', 'Zr++' becomes 'Z r 2 plus', 'Cr2O3' becomes 'C r 2 O 3'.
+4. **Fractions and Ratios**: Use 'over' for fractions and 'per' for ratios. For example, 'E/A' becomes 'E over A', 'milligrams/millimeter' becomes 'milligrams per millimeter', '8/70' becomes '8 over 70', '1/2' becomes '1 over 2', 'mg/ml' becomes 'milligrams per milliliter'.
+5. **Ranges**: Spell out ranges indicated with hyphens as 'to'. For example, '400-2100 nanometers' becomes '400 to 2100 nanometers', '12-21' becomes '12 to 21', '5-10%' becomes '5 to 10 percent', '9am-5pm' becomes '9 a m to 5 p m'.
+6. **Units and Measurements**: Spell out units fully or use appropriate descriptions. For example, 'mg/Kg' becomes 'milligrams per kilograms', '42mW' becomes '42 milliwatts', '1.65K' becomes '1.65 Kelvin', '1800W' becomes '1800 watts', '50 K' becomes '50 Kelvin', '24 h' becomes '24 hour'.
+7. **Roman Numerals**: Convert Roman numerals to their numeric equivalents and space them appropriately. For example, 'Ni(II)' becomes 'N i 2', 'Cu(II)' becomes 'C u 2', 'Fe(III)' becomes 'F e 3'.
+8. **Mathematical Expressions**: Spell out mathematical operations and symbols clearly. For example, 'Rf + Rct' becomes 'Rf plus Rct', 'Log |Z|' becomes 'logarithm of the absolute value of Z', '(B₁-B₀)/B₀' becomes 'B 1 minus B 0 over B 0', 'x²' becomes 'x squared', '√x' becomes 'square root of x'.
+9. **Symbols**: Convert symbols to words:
+   - '&' → 'and'
+   - '%' → 'percentage'
+   - '@' → 'at'
+   - '#' → 'number' or 'hash'
+   - '$' → 'dollar'
+   - '+' → 'plus'
+   - '=' → 'equals'
+   - '<' → 'less than'
+   - '>' → 'greater than'
+   - '/' → 'slash' (but see rules 4 and 21 for specific cases)
+   - '°' → 'degrees'
+   - '±' → 'plus or minus'
+   - '×' → 'times'
+   - '÷' → 'divided by'
+   - '√' → 'square root'
+   - '∞' → 'infinity'
+   - '≈' → 'approximately equal to'
+   - '≠' → 'not equal to'
+   - '≤' → 'less than or equal to'
+   - '≥' → 'greater than or equal to'
+   - '-' → 'minus' (in mathematical contexts) or 'to' (in ranges)
+   - 'α' → 'alpha'
+   - 'β' → 'beta'
+   - 'γ' → 'gamma'
+   - '→' → 'yields' or 'leads to'
+   - '←' → 'comes from'
+   - '↔' → 'reversible reaction'
+10. **Panel References**: Clarify panel references with 'prime' or 'double prime'. For example, 'panel d'' becomes 'panel d double prime', 'panel c'' becomes 'panel c prime', 'figure a'' becomes 'figure a prime'.
+11. **Avoid Redundant Color References**: Do not mention colors unless essential for understanding. For example, 'orange curved lines' becomes 'curved lines' if color is not critical, 'the red line' becomes 'the line' unless color distinguishes it.
+12. **Full Forms**: Provide full forms for abbreviations or terms that might be unclear. For example, 'dpa' becomes 'displacements per atom', 'mAU' removed when 'milli absorbance units' is present, 'unirr.' becomes 'unirradiated', 'irrd.' becomes 'irradiated', 'TEM' becomes 'T E M (transmission electron microscopy)' if context requires clarification.
+13. **Avoid Image Identification Terms**: Replace 'image', 'figure', or 'photograph' with specific terms like 'scan', 'graph', or 'diagram' based on context. For example, 'the image shows' becomes 'the graph illustrates', 'the photograph depicts' becomes 'the scan depicts'.
+14. **Consistent Spacing**: Ensure consistent spacing for all abbreviations throughout the text. For example, 'YLF' should always be 'Y L F'.
+15. **Preserve Meaning**: Do not change the meaning or content of the original text; only modify spacing, symbol representation, and other aspects as per these rules.
+16. **Preserve Common Words**: Do not space out common words that happen to be 3 letters or more, such as 'the', 'and', 'but', etc.
+17. **Numbers in Context**: Preserve numbers in context, such as measurements ('5mm', '10kg', '25°C'), but ensure units are spelled out or appropriately described. For example, '5-6 percent' becomes '5 to 6 percentage'.
+18. **Units of Measurement**: Spell out units like 'W' for 'watts', 'K' for 'Kelvin', 'nm' for 'nanometers', 'h' for 'hour'. For example, '50 K' becomes '50 Kelvin', '24 h' becomes '24 hour', '75 cm' becomes '75 centimeter'.
+19. **Ordinal Numbers**: Convert ordinal abbreviations to full words. For example, '100th' becomes 'hundredth', '80th' becomes 'eightieth'.
+20. **Mathematical Symbols in Context**: Spell out appropriately in context. For example, 'x-axis' becomes 'horizontal axis', 'y-axis' becomes 'vertical axis', 'K/W at Re=100' becomes 'Kelvin over watts at Reynolds number equals 100'.
+21. **Clarify Ambiguous Terms**: Use 'or' for ambiguous slashes unless context dictates otherwise. For example, 'import/export' becomes 'import or export', 'forces/moments' becomes 'forces or moments'.
+22. **Avoid Unnecessary Capitalization**: Use lowercase unless proper nouns or sentence beginnings require capitalization.
+23. **Remove Brackets and Quotation Marks**: Do not use brackets (parentheses, square brackets, curly braces) or quotation marks (single or double quotes) in the alt text. Convert bracketed content to natural language flow. For example, 'T E M (transmission electron microscopy)' becomes 'T E M transmission electron microscopy', 'labeled "normal"' becomes 'labeled normal', '[indicated by arrow]' becomes 'indicated by arrow'.
+24. **Arrow Type Preservation**: When formatting arrow descriptions, preserve the arrow type distinction. For example, 'perpendicular-ending arrow' remains 'perpendicular ending arrow', 'bidirectional arrow' remains 'bidirectional arrow', 'loop arrow' remains 'loop arrow'. Do not simplify all arrows to just 'arrow'.
+25. **Preserve Mandatory Phrases**: The phrases "Alt text begins" and "Alt text provided by Elsevier" must be preserved exactly as written in the final formatted output. Do not alter, abbreviate, space out, or apply screen reader formatting rules to these two phrases.
+
+**FINAL VERIFICATION:**
+- Read through the alt text to ensure every symbol has been replaced with its word equivalent.
+- Check that all abbreviations are spaced out consistently.
+- Verify all ranges use 'to' instead of dashes or slashes.
+- Ensure no forward slashes remain unless contextually appropriate.
+- Confirm all mathematical and chemical notation is spelled out clearly.
+- Double-check that no common words are mistakenly spaced out.
+- Verify that no brackets (parentheses, square brackets, curly braces) or quotation marks remain in the text.
+- **MANDATORY FINAL CHECK**: Confirm that every alt text string in the JSON output begins with "Alt text begins" and ends with "Alt text provided by Elsevier". If either phrase is absent, correct before returning.
+
+Please review the following alt text and apply the above rules to make it accessible for screen readers. Return only the corrected alt text with no additional commentary, explanations, or formatting.
+
+---
+
+## OUTPUT FORMAT
+
+Return your response as a JSON object with this EXACT structure:
+
+```json
+{{
+  "classification": "SIMPLE" | "MODERATE" | "COMPLEX",
+  "short_alt_text_formatted": "string (after Task 3 formatting)",
+  "long_alt_text_formatted": "string (after Task 3 formatting)",
+  "confidence_score": 1-10,
+  "relevance_score": 1-10,
+  "correctness_score": 1-10,
+  "accuracy_score": 1-10
+}}
+```
+
+**MANDATORY FOR ALL IMAGE TYPES — SHORT AND LONG ALT TEXT:**
+Every value in `short_alt_text_formatted` and `long_alt_text_formatted` MUST:
+- Begin with: **Alt text begins**
+- End with: **Alt text provided by Elsevier**
+
+These two phrases are non-negotiable and must appear in every output, regardless of classification level.
+
+CHARACTER REQUIREMENTS FOR ALL IMAGE TYPES — STRICTLY ENFORCED:
+
+CLASSIFICATION IS DETERMINED BY LONG ALT TEXT CHARACTER COUNT AND CONTENT COMPLEXITY:
+- If long alt text is MORE than 700 characters: classification MUST be COMPLEX.
+- If long alt text is LESS than or equal to 700 characters BUT the image has 4+ panels: classification MUST be COMPLEX (expand description to exceed 700 chars).
+- If long alt text is LESS than or equal to 700 characters AND image has 2-3 panels or moderate complexity: classification is MODERATE.
+- Do NOT label an image COMPLEX if the long alt text is under 700 characters UNLESS it has 4+ panels or other automatic COMPLEX triggers.
+- Do NOT label an image MODERATE if the long alt text exceeds 700 characters.
+
+AUTOMATIC COMPLEX CLASSIFICATION TRIGGERS (Override character count):
+- 4 or more panels/sub-figures → MUST be COMPLEX (write description to exceed 700 characters)
+- 5 or more data series → MUST be COMPLEX (write description to exceed 700 characters)
+- More than 15 labels → MUST be COMPLEX (write description to exceed 700 characters)
+- Multi-panel research figures with labels A, B, C, D, etc. → MUST be COMPLEX
+- Dense composite figures combining multiple visualization types → MUST be COMPLEX
+
+CRITICAL OVERRIDE RULE FOR CLASSIFICATION:
+- SIMPLE classification is valid if the image meets ALL mandatory SIMPLE criteria AND can be fully described in under 230 characters.
+- If the image has MULTIPLE panels (2+), it CANNOT be SIMPLE.
+- If the image has MULTIPLE data series (3+), it CANNOT be SIMPLE.
+- Medical images with SINGLE straightforward finding CAN be SIMPLE.
+- Graphs with 1-2 lines/bars and basic labels CAN be SIMPLE.
+- Multi-panel images (4+) are ALWAYS COMPLEX.
+- When in doubt between SIMPLE and MODERATE, consider: Can this be fully and accurately described in one brief sentence (under 230 chars)? If YES → SIMPLE. If NO → MODERATE.
+- When in doubt between MODERATE and COMPLEX, consider: 
+  * Does the image have 4+ panels? → COMPLEX
+  * Does the description naturally exceed 700 characters? → COMPLEX
+  * Does each panel require detailed individual description? → COMPLEX
+  * If NO to all above → MODERATE
+
+PRE-CLASSIFICATION CHECK:
+Before finalizing classification, ask yourself:
+1. How many panels does this image have? (4+ = AUTOMATIC COMPLEX)
+2. How many data series/lines? (5+ = AUTOMATIC COMPLEX)
+3. How many labels total? (15+ = AUTOMATIC COMPLEX)
+4. Will my complete description exceed 700 characters? (YES = COMPLEX)
+5. If MODERATE, can I describe this adequately in under 700 characters? (NO = reclassify as COMPLEX)
+
+**For SIMPLE images:**
+- Generate alt text (200 characters for description content, excluding prefix and suffix), then apply Task 3 formatting
+- `short_alt_text_formatted` and `long_alt_text_formatted` should be identical
+- Both must follow the pattern: "Alt text begins. [description]. Alt text provided by Elsevier."
+
+**For MODERATE images:**
+- Generate short alt text (under 30 words AND under 200 characters for description content) and long alt text (under 700 characters for description content, starts with "The")
+- Apply Task 3 formatting to both
+- Both must follow the pattern: "Alt text begins. [description]. Alt text provided by Elsevier."
+
+**For COMPLEX images:**
+- Generate short alt text (under 30 words AND under 200 characters for description content) and long alt text (over 700 characters for description content, starts with "The")
+- Apply Task 3 formatting to both
+- Both must follow the pattern: "Alt text begins. [description]. Alt text provided by Elsevier."
+
+CRITICAL FOR COMPLEX IMAGES:
+- If the image has 4+ panels, 5+ data series, or 15+ labels, you MUST write a detailed description exceeding 700 characters.
+- Do NOT summarize or abbreviate to stay under 700 characters - COMPLEX images require comprehensive descriptions.
+- Describe EVERY panel individually and completely.
+- Describe EVERY data series with full trend analysis.
+- Include ALL spatial relationships, labels, and technical details.
+- If your first draft is under 700 characters for a 4+ panel image, you are not being thorough enough - expand the description.
+
+---
+
+**IMPORTANT REMINDERS:**
+- NO color descriptions whatsoever
+- Count panels carefully for multi-part images
+- Apply Task 3 formatting rules consistently
+- Include ALL text elements, labels, and values
+- Verify technical terminology accuracy
+- Every single alt text output MUST begin with "Alt text begins" and end with "Alt text provided by Elsevier"
+
+Now analyze the provided image and return ONLY the JSON response with no additional text or explanation.
+"""
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+class GeminiImageProcessor:
+    def __init__(self):
+        self.max_retries = 3
+        self.base_delay = 1
+
+        # ── Build the LangChain chain once at init time ──────────────────────
+        #
+        # 1. Model — wraps Gemini via the Google Generative AI LangChain integration.
+        #    We use gemini-2.5-flash-image which supports vision inputs.
+        #    temperature=0.1 for consistent, deterministic output.
+        #    max_output_tokens=16384 for long descriptions.
+        #    max_retries is handled by LangChain internally (uses tenacity).
+        #    response_mime_type ensures JSON output format.
+        self.llm = ChatGoogleGenerativeAI(
+            model=GEMINI_MODEL,
+            temperature=0.1,
+            max_output_tokens=16384,
+            max_retries=self.max_retries,
+            credentials=credentials,
+            project=credentials.project_id,
+            location=GCP_LOCATION,
+            response_mime_type="application/json",
+        )
+
+        # 2. Output parser — replaces your manual parse_json_response().
+        #    JsonOutputParser strips ```json fences and calls json.loads() for you.
+        self.parser = JsonOutputParser()
+
+        # 3. Prompt template — replaces the raw f-string formatting.
+        #    We build the full text prompt here; the image bytes are injected
+        #    separately inside build_messages() because LangChain sends vision
+        #    data as a HumanMessage with mixed content parts.
+        self.prompt_template = ChatPromptTemplate.from_messages([
+            ("human", "{full_prompt}")   # image is added as a content part below
+        ])
+
+        # 4. LCEL chain: prompt | model | parser
+        #    Chain is built but bypassed for actual invocation - we call llm.invoke() 
+        #    directly to cleanly inject image bytes. Parser is still applied manually.
+        self.chain = self.prompt_template | self.llm | self.parser
+
+        self.log_message("LangChain model initialized with temperature=0.1, JSON output enforced")
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # CAPTION INSTRUCTION  (unchanged from your original)
+    # ──────────────────────────────────────────────────────────────────────────
+    def create_caption_instruction(self, caption: str) -> str:
+        if caption:
+            return (
+                f'\n**IMAGE CAPTION CONTEXT:**\n'
+                f'The image has the following caption: "{caption}"\n\n'
+                f'Use this caption as reference material. Do NOT repeat the caption verbatim.\n'
+            )
+        return "**No caption provided for this image.**"
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # LOGGING  (unchanged)
+    # ──────────────────────────────────────────────────────────────────────────
+    def log_message(self, message: str) -> None:
+        timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        entry = f"[{timestamp}] {message}"
+        print(entry)
+        with open(LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(entry + "\n")
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # BUILD LANGCHAIN MESSAGE WITH IMAGE
+    #
+    # LangChain's ChatGoogleGenerativeAI accepts vision inputs via a
+    # HumanMessage whose content is a list of dicts — one dict for the text
+    # prompt and one for the base64-encoded image.  We bypass the
+    # ChatPromptTemplate for the final invoke and build the message manually
+    # so we can attach the image bytes cleanly.
+    # ──────────────────────────────────────────────────────────────────────────
+    def build_human_message(self, image_path: str, full_prompt: str) -> HumanMessage:
+        """Return a HumanMessage containing the prompt text + base64 image."""
+        with open(image_path, "rb") as f:
+            image_bytes = f.read()
+
+        mime_type = self._get_mime_type(image_path)
+        image_b64 = base64.b64encode(image_bytes).decode("utf-8")
+
+        # LangChain multimodal content format for Google GenAI
+        content = [
+            {"type": "text", "text": full_prompt},
+            {
+                "type": "image_url",
+                "image_url": {
+                    "url": f"data:{mime_type};base64,{image_b64}"
+                },
+            },
+        ]
+        return HumanMessage(content=content)
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # CALL GEMINI VIA LANGCHAIN  (replaces call_gemini_single_prompt)
+    #
+    # We call self.llm directly with the pre-built HumanMessage instead of
+    # going through the chain, because the chain's prompt step would try to
+    # render the template again.  The parser step is still applied manually.
+    # This keeps the image-injection clean while still using the LangChain
+    # model wrapper (retry logic, callbacks, LangSmith tracing all active).
+    # ──────────────────────────────────────────────────────────────────────────
+    def call_gemini_via_langchain(self, image_path: str, full_prompt: str) -> dict:
+        message = self.build_human_message(image_path, full_prompt)
+        response = self.llm.invoke([message])
+
+        text = self._response_text(response)
+        self.log_message(f"LangChain raw response (first 200 chars): {text[:200]}")
+        return self.parser.parse(text)
+
+    @staticmethod
+    def _response_text(response) -> str:
+        """Gemini 3.x returns content as a list of blocks; join the text parts."""
+        c = response.content
+        if isinstance(c, str):
+            return c
+        return "".join(
+            p if isinstance(p, str) else p.get("text", "")
+            for p in c
+            if isinstance(p, str) or (isinstance(p, dict) and p.get("type") == "text")
+        )
+    # ──────────────────────────────────────────────────────────────────────────
+    # MIME TYPE HELPER  (unchanged)
+    # ──────────────────────────────────────────────────────────────────────────
+    def _get_mime_type(self, image_path: str) -> str:
+        ext = image_path.lower().rsplit(".", 1)[-1]
+        return {
+            "png": "image/png",
+            "jpg": "image/jpeg",
+            "jpeg": "image/jpeg",
+            "bmp": "image/bmp",
+            "tiff": "image/tiff",
+        }.get(ext, "image/jpeg")
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # POST-PROCESSOR: Fix flowchart terminal endpoints
+    # ──────────────────────────────────────────────────────────────────────────
+    def fix_flowchart_terminal_endpoints(self, long_alt_text: str, short_alt_text: str) -> str:
+        """
+        Post-process flowchart descriptions to add missing 'terminal endpoint' phrases.
+        
+        Gemini consistently ignores prompts about terminal endpoints, so we fix them here.
+        
+        Strategy:
+        1. Find all boxes that arrows "point to" or "lead to"
+        2. Check if those boxes have arrows going OUT (continuation detected)
+        3. If NO continuation, add "which is a terminal endpoint"
+        """
+        # Check if this is a flowchart
+        combined_text = (short_alt_text + " " + long_alt_text).lower()
+        if "flowchart" not in combined_text:
+            return long_alt_text 
+        
+        # Already has terminal endpoint phrases
+        if "terminal endpoint" in long_alt_text.lower() or "terminates" in long_alt_text.lower():
+            return long_alt_text
+        
+        import re
+        
+        # Split by sentences (on ". " not just ".")
+        sentences = long_alt_text.split('. ')
+        fixed_sentences = []
+        
+        # Pattern for boxes that arrows point TO (made more flexible)
+        destination_box_pattern = (
+            r'(?:point[s]?(?:ing)?|lead[s]?|connect[s]?)\s+to\s+'
+            r'(?:a\s+|the\s+)?(?:text\s+)?(?:box|rectangle|node)'
+        )
+        
+        # Patterns indicating a box has arrows going OUT (not a terminal)
+        outgoing_arrow_patterns = [
+            r'arrows?\s+(?:extend[s]?|emerge[s]?|branch[es]?|exit[s]?)\s+(?:from|downward|upward)',
+            r'from\s+(?:this|the|that)\s+(?:box|node|rectangle)',
+        ]
+        
+        for i, sentence in enumerate(sentences):
+            sentence_lower = sentence.lower()
+            
+            # Does this sentence describe a box as a destination?
+            if re.search(destination_box_pattern, sentence_lower):
+                # This is a destination box - check if it has continuations
+                
+                has_outgoing = False
+                
+                # Look in IMMEDIATE next sentence only (more accurate)
+                if i + 1 < len(sentences):
+                    next_sent = sentences[i + 1].lower()
+                    
+                    # Skip if next sentence is the ending phrase
+                    if "alt text provided" in next_sent:
+                        # This is the last real sentence, so it's a terminal endpoint
+                        has_outgoing = False
+                    else:
+                        # Check if next sentence describes arrows FROM this box
+                        for pattern in outgoing_arrow_patterns:
+                            if re.search(pattern, next_sent):
+                                has_outgoing = True
+                                break
+                else:
+                    # No next sentence = terminal endpoint
+                    has_outgoing = False
+                
+                # If no outgoing arrows found, this is a terminal endpoint
+                if not has_outgoing and "terminal endpoint" not in sentence_lower:
+                    # Add terminal endpoint phrase
+                    if sentence.endswith('.'):
+                        sentence = sentence[:-1] + ", which is a terminal endpoint."
+                    else:
+                        sentence = sentence + ", which is a terminal endpoint"
+            
+            fixed_sentences.append(sentence)
+        
+        # Reconstruct
+        fixed_text = '. '.join(fixed_sentences)
+        fixed_text = fixed_text.replace('..', '.')
+        fixed_text = re.sub(r'\s+', ' ', fixed_text)
+        
+        return fixed_text
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # MAIN METHOD  (same interface as before — lambda_function.py unchanged)
+    # ──────────────────────────────────────────────────────────────────────────
+    def process_image(self, image_path: str, caption: str) -> dict:
+        """
+        Process one image + caption and return the result dict.
+        This method signature is identical to the original — lambda_function.py
+        calls it exactly the same way.
+        """
+        try:
+            self.log_message(f"Processing image: {os.path.basename(image_path)}")
+
+            unique_id    = str(uuid.uuid4())
+            img_name     = os.path.basename(image_path)
+            current_date = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+            # Build the full text prompt (caption injected, same as before)
+            caption_instruction = self.create_caption_instruction(caption)
+            full_prompt = COMBINED_GEMINI_PROMPT.format(
+                caption_instruction=caption_instruction
+            )
+
+            self.log_message("Calling Gemini via LangChain chain...")
+
+            # ── Single call replaces: call_gemini_single_prompt + parse_json_response
+            parsed_data = self.call_gemini_via_langchain(image_path, full_prompt)
+
+            # ── Everything below is identical to your original process_image logic ──
+            complexity = parsed_data["classification"].upper()
+            short_alt  = parsed_data.get("short_alt_text_formatted", "")
+            long_alt   = parsed_data.get("long_alt_text_formatted", "")
+
+            # Override MODERATE/COMPLEX based on long alt text character count
+            if complexity != "SIMPLE":
+                complexity = "COMPLEX" if len(long_alt) >= 700 else "MODERATE"
+
+            # SIMPLE images: no long alt text
+            if complexity == "SIMPLE":
+                long_alt = ""
+                if not short_alt:
+                    short_alt = parsed_data.get("long_alt_text_formatted", "")
+
+            # ═══════════════════════════════════════════════════════════════════════
+            # POST-PROCESSING: Fix flowchart terminal endpoints
+            # ═══════════════════════════════════════════════════════════════════════
+            # Check if this is a flowchart and fix missing terminal endpoint phrases
+            if long_alt:
+                long_alt = self.fix_flowchart_terminal_endpoints(long_alt, short_alt)
+            # ═══════════════════════════════════════════════════════════════════════
+
+            result = {
+                "temp_image_path":          image_path,
+                "img_name":                 img_name,
+                "ID":                       unique_id,
+                "Date":                     current_date,
+                "Image_complexity":         complexity,
+                "SME_Remark_on_complexity": "",
+                "short_alt_text":           short_alt,
+                "long_alt_text":            long_alt,
+                "SME_long_alt_text":        "",
+                "SME_short_alt_text":       "",
+                "image_caption":            caption,
+                "Confidence_Score":         parsed_data.get("confidence_score", 0),
+                "Relevance_Score":          parsed_data.get("relevance_score", 0),
+                "Correctness_Score":        parsed_data.get("correctness_score", 0),
+                "Accuracy_Score":           parsed_data.get("accuracy_score", 0),
+            }
+
+            self.log_message(f"Successfully processed: {img_name}")
+            return result
+
+        except Exception as e:
+            self.log_message(f"Error processing image {image_path}: {str(e)}")
+            import traceback
+            self.log_message(traceback.format_exc())
+            return {"Error": "Image not processed"}
