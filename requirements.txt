@@ -1,0 +1,46 @@
+# ─── Frontlist Alt-Text Pipeline — Python dependencies ───────────────────────
+# Install with:  pip install -r requirements.txt
+# Requires Python 3.14 / Windows 11 (64-bit)
+#
+# All versions below ship pre-built cp314 or stable-ABI wheels for
+# Python 3.14 on Windows x64 — no C compiler or Visual Studio required.
+
+# ── Google / Gemini ───────────────────────────────────────────────────────────
+# protobuf 4.x has a C extension incompatible with Python 3.14 metaclasses.
+# 5.x+ ships a cp310-abi3 stable wheel that works on Python 3.14.
+protobuf==6.33.6
+google-auth==2.58.0
+google-cloud-aiplatform==2.1.3
+langchain-google-genai==4.4.0
+langchain-core==1.6.3
+
+# ── AWS (required even in local mode — boto3 is imported at module level) ─────
+boto3==1.34.101
+botocore==1.34.101
+
+# ── PDF processing ────────────────────────────────────────────────────────────
+# 1.28.x ships a stable-ABI wheel (cp310-abi3) that covers Python 3.14
+PyMuPDF==1.28.2
+
+# ── Image processing ──────────────────────────────────────────────────────────
+Pillow==12.3.0
+numpy==2.5.3
+opencv-python==4.11.0.86
+
+# ── Excel / DOCX ─────────────────────────────────────────────────────────────
+# pandas 3.0.5 requires openpyxl >= 3.1.5
+pandas==3.0.5
+openpyxl==3.1.5
+python-docx==1.1.2
+XlsxWriter==3.2.0
+
+# ── Windows COM (tracked-change acceptance in Word) ───────────────────────────
+# pywin32 312 is the minimum version for Python 3.14
+pywin32==312
+
+# ── Watchdog (folder monitoring) ─────────────────────────────────────────────
+watchdog==4.0.1
+
+# ── Utilities ─────────────────────────────────────────────────────────────────
+requests==2.32.2
+tenacity==8.3.0
